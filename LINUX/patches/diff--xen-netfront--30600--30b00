@@ -1,0 +1,92 @@
+diff --git a/usr/src/linux-3.6.10/drivers/net/xen-netfront.c b/LINUX/xen-netfront/xen-netfront.c
+index 650f79a..d0b68fa 100644
+--- a/usr/src/linux-3.6.10/drivers/net/xen-netfront.c
++++ b/LINUX/xen-netfront/xen-netfront.c
+@@ -81,6 +81,10 @@ struct netfront_stats {
+ struct netfront_info {
+ 	struct list_head list;
+ 	struct net_device *netdev;
++#if defined(CONFIG_NETMAP)
++	int netmap;
++	void *na_priv;
++#endif
+ 
+ 	struct napi_struct napi;
+ 
+@@ -140,6 +144,10 @@ struct netfront_rx_info {
+ 	struct xen_netif_extra_info extras[XEN_NETIF_EXTRA_TYPE_MAX - 1];
+ };
+ 
++#if defined(CONFIG_NETMAP) || defined(CONFIG_NETMAP_MODULE)
++#include "netfront_netmap_linux.h"
++#endif
++
+ static void skb_entry_set_link(union skb_entry *list, unsigned short id)
+ {
+ 	list->link = id;
+@@ -1477,6 +1485,12 @@ static int setup_netfront(struct xenbus_device *dev, struct netfront_info *info)
+ 		goto fail;
+ 	}
+ 
++#ifdef CONFIG_NETMAP
++	if (info->netmap) {
++		setup_netfront_netmap(dev, info);
++		return 0;
++	}
++#endif
+ 	txs = (struct xen_netif_tx_sring *)get_zeroed_page(GFP_NOIO | __GFP_HIGH);
+ 	if (!txs) {
+ 		err = -ENOMEM;
+@@ -1616,12 +1630,18 @@ static int xennet_connect(struct net_device *dev)
+ 	struct xen_netif_rx_request *req;
+ 	unsigned int feature_rx_copy;
+ 
++	err = xenbus_scanf(XBT_NIL, np->xbdev->otherend, "feature-netmap", "%u",
++			   &np->netmap);
++	if (err == -ENOENT)
++		np->netmap = 0;
++
++
+ 	err = xenbus_scanf(XBT_NIL, np->xbdev->otherend,
+ 			   "feature-rx-copy", "%u", &feature_rx_copy);
+ 	if (err != 1)
+ 		feature_rx_copy = 0;
+ 
+-	if (!feature_rx_copy) {
++	if (!feature_rx_copy && !np->netmap) {
+ 		dev_info(&dev->dev,
+ 			 "backend does not support copying receive path\n");
+ 		return -ENODEV;
+@@ -1630,6 +1650,9 @@ static int xennet_connect(struct net_device *dev)
+ 	err = talk_to_netback(np->xbdev, np);
+ 	if (err)
+ 		return err;
++	if (np->netmap) {
++		return 0;
++	}
+ 
+ 	rtnl_lock();
+ 	netdev_update_features(dev);
+@@ -1709,6 +1732,10 @@ static void netback_changed(struct xenbus_device *dev,
+ 		if (xennet_connect(netdev) != 0)
+ 			break;
+ 		xenbus_switch_state(dev, XenbusStateConnected);
++#ifdef CONFIG_NETMAP
++		if (np->netmap)
++			netfront_netmap_attach(np);
++#endif
+ 		break;
+ 
+ 	case XenbusStateConnected:
+@@ -1916,6 +1943,11 @@ static int __devexit xennet_remove(struct xenbus_device *dev)
+ 
+ 	dev_dbg(&dev->dev, "%s\n", dev->nodename);
+ 
++#ifdef CONFIG_NETMAP
++    if (info->netmap)
++        xennet_netmap_disconnect(info);
++#endif
++
+ 	xennet_disconnect_backend(info);
+ 
+ 	xennet_sysfs_delif(info->netdev);

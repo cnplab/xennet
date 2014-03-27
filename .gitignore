@@ -1,0 +1,17 @@
+Module.symvers
+modules.order
+.*.cmd
+*builtin
+*.gcno
+.tmp_*.gcno
+.*.cmd
+*.o
+*.ko
+*mod.c
+*.tmp_versions/
+*/include/netmap
+bdgfnctl
+LINUX/*.c
+LINUX/xen-netback
+LINUX/xen-netfront
+.DS_Store

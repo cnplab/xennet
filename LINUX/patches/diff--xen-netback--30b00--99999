@@ -1,0 +1,205 @@
+diff --git a/usr/src/linux-source-3.12/drivers/net/xen-netback/common.h b/LINUX/xen-netback/common.h
+index 400fea1..2de72d6 100644
+--- a/usr/src/linux-source-3.12/drivers/net/xen-netback/common.h
++++ b/LINUX/xen-netback/common.h
+@@ -97,6 +97,20 @@ struct xenvif_rx_meta {
+ 
+ #define MAX_PENDING_REQS 256
+ 
++#ifdef CONFIG_NETMAP
++struct nm_grant_ring {
++	struct page **ring_pg;
++	struct page **buf_pg;
++	int *ring_ref;
++	int *buf_ref;
++	unsigned int kring_pof;
++	uint16_t irq;
++	uint16_t port;
++	uint16_t nr_buf_pgs;
++	uint16_t nr_ring_pgs;
++};
++#endif
++
+ struct xenvif {
+ 	/* Unique identifier for this interface. */
+ 	domid_t          domid;
+@@ -158,6 +172,12 @@ struct xenvif {
+ 	/* Internal feature information. */
+ 	u8 can_queue:1;	    /* can queue packets for receiver? */
+ 
++#ifdef CONFIG_NETMAP
++	u8 netmap:1;
++	struct nm_grant_ring nmtx;
++	struct nm_grant_ring nmrx;
++#endif
++
+ 	/* Transmit shaping: allow 'credit_bytes' every 'credit_usec'. */
+ 	unsigned long   credit_bytes;
+ 	unsigned long   credit_usec;
+diff --git a/usr/src/linux-source-3.12/drivers/net/xen-netback/interface.c b/LINUX/xen-netback/interface.c
+index 459935a..68f7ebe 100644
+--- a/usr/src/linux-source-3.12/drivers/net/xen-netback/interface.c
++++ b/LINUX/xen-netback/interface.c
+@@ -38,6 +38,10 @@
+ #include <xen/events.h>
+ #include <asm/xen/hypercall.h>
+ 
++#if defined(CONFIG_NETMAP) || defined(CONFIG_NETMAP_MODULE)
++#include <netback_netmap_linux.h>
++#endif
++
+ #define XENVIF_QUEUE_LENGTH 32
+ #define XENVIF_NAPI_WEIGHT  64
+ 
+@@ -54,6 +58,12 @@ static int xenvif_rx_schedulable(struct xenvif *vif)
+ static irqreturn_t xenvif_tx_interrupt(int irq, void *dev_id)
+ {
+ 	struct xenvif *vif = dev_id;
++#ifdef CONFIG_NETMAP
++	if (vif->netmap) {
++		xenvif_netmap_irqsched(vif, 1);
++		return IRQ_HANDLED;
++	}
++#endif /* CONFIG_NETMAP */
+ 
+ 	if (RING_HAS_UNCONSUMED_REQUESTS(&vif->tx))
+ 		napi_schedule(&vif->napi);
+@@ -104,6 +114,13 @@ static irqreturn_t xenvif_rx_interrupt(int irq, void *dev_id)
+ {
+ 	struct xenvif *vif = dev_id;
+ 
++#ifdef CONFIG_NETMAP
++	if (vif->netmap) {
++		xenvif_netmap_irqsched(vif, 0);
++		return IRQ_HANDLED;
++	}
++#endif /* CONFIG_NETMAP */
++
+ 	if (xenvif_rx_schedulable(vif))
+ 		netif_wake_queue(vif->dev);
+ 
+@@ -162,6 +179,10 @@ static struct net_device_stats *xenvif_get_stats(struct net_device *dev)
+ 
+ static void xenvif_up(struct xenvif *vif)
+ {
++#ifdef CONFIG_NETMAP
++	if (vif->netmap)
++		return xenvif_netmap_up(vif);
++#endif
+ 	napi_enable(&vif->napi);
+ 	enable_irq(vif->tx_irq);
+ 	if (vif->tx_irq != vif->rx_irq)
+@@ -171,6 +192,10 @@ static void xenvif_up(struct xenvif *vif)
+ 
+ static void xenvif_down(struct xenvif *vif)
+ {
++#ifdef CONFIG_NETMAP
++	if (vif->netmap)
++		return xenvif_netmap_down(vif);
++#endif
+ 	napi_disable(&vif->napi);
+ 	disable_irq(vif->tx_irq);
+ 	if (vif->tx_irq != vif->rx_irq)
+@@ -351,6 +376,10 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
+ 		return ERR_PTR(err);
+ 	}
+ 
++#ifdef CONFIG_NETMAP
++	xenvif_netmap_attach(vif);
++#endif
++
+ 	netdev_dbg(dev, "Successfully created xenvif\n");
+ 
+ 	__module_get(THIS_MODULE);
+@@ -368,9 +397,11 @@ int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
+ 	if (vif->tx_irq)
+ 		return 0;
+ 
+-	err = xenvif_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
+-	if (err < 0)
+-		goto err;
++	if (!vif->netmap) {
++		err = xenvif_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
++		if (err < 0)
++			goto err;
++	}
+ 
+ 	if (tx_evtchn == rx_evtchn) {
+ 		/* feature-split-event-channels == 0 */
+@@ -405,8 +436,8 @@ int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
+ 	}
+ 
+ 	init_waitqueue_head(&vif->wq);
+-	vif->task = kthread_create(xenvif_kthread,
+-				   (void *)vif, "%s", vif->dev->name);
++	vif->task = kthread_create((!vif->netmap ? xenvif_kthread :
++		xenvif_netmap_kthread), (void *)vif, "%s", vif->dev->name);
+ 	if (IS_ERR(vif->task)) {
+ 		pr_warn("Could not allocate kthread for %s\n", vif->dev->name);
+ 		err = PTR_ERR(vif->task);
+@@ -475,6 +506,9 @@ void xenvif_free(struct xenvif *vif)
+ {
+ 	netif_napi_del(&vif->napi);
+ 
++#ifdef CONFIG_NETMAP
++	xenvif_netmap_detach(vif);
++#endif
+ 	unregister_netdev(vif->dev);
+ 
+ 	free_netdev(vif->dev);
+diff --git a/usr/src/linux-source-3.12/drivers/net/xen-netback/xenbus.c b/LINUX/xen-netback/xenbus.c
+index 1b08d87..394c1ec 100644
+--- a/usr/src/linux-source-3.12/drivers/net/xen-netback/xenbus.c
++++ b/LINUX/xen-netback/xenbus.c
+@@ -92,6 +92,13 @@ static int netback_probe(struct xenbus_device *dev,
+ 			goto fail;
+ 		}
+ 
++#if CONFIG_NETMAP
++		err = xenbus_printf(xbt, dev->nodename, "feature-netmap", "%d", 0);
++		if (err) {
++			message = "writing feature-netmap";
++			goto abort_transaction;
++		}
++#endif
+ 		err = xenbus_printf(xbt, dev->nodename, "feature-sg", "%d", sg);
+ 		if (err) {
+ 			message = "writing feature-sg";
+@@ -505,10 +512,18 @@ static int connect_rings(struct backend_info *be)
+ 	int err;
+ 	int val;
+ 
++#ifdef CONFIG_NETMAP
++	if (xenbus_scanf(XBT_NIL, dev->nodename, "feature-netmap",
++				"%d", &val) < 0) {
++		val = 0;
++	}
++	vif->netmap = !!val;
++#endif
++
+ 	err = xenbus_gather(XBT_NIL, dev->otherend,
+ 			    "tx-ring-ref", "%lu", &tx_ring_ref,
+ 			    "rx-ring-ref", "%lu", &rx_ring_ref, NULL);
+-	if (err) {
++	if (err && !vif->netmap) {
+ 		xenbus_dev_fatal(dev, err,
+ 				 "reading %s/ring-ref",
+ 				 dev->otherend);
+@@ -531,6 +546,9 @@ static int connect_rings(struct backend_info *be)
+ 		rx_evtchn = tx_evtchn;
+ 	}
+ 
++	if (vif->netmap)
++		goto skip_features;
++
+ 	err = xenbus_scanf(XBT_NIL, dev->otherend, "request-rx-copy", "%u",
+ 			   &rx_copy);
+ 	if (err == -ENOENT) {
+@@ -576,6 +594,7 @@ static int connect_rings(struct backend_info *be)
+ 		val = 0;
+ 	vif->csum = !val;
+ 
++skip_features:
+ 	/* Map the shared frame, irq etc. */
+ 	err = xenvif_connect(vif, tx_ring_ref, rx_ring_ref,
+ 			     tx_evtchn, rx_evtchn);

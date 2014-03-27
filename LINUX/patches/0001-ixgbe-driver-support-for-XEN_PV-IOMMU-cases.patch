@@ -1,0 +1,154 @@
+From 6efb533badb18bb3461f0f28b6412812cb6d55a1 Mon Sep 17 00:00:00 2001
+From: Joao Martins <Joao.Martins@neclab.eu>
+Date: Fri, 7 Feb 2014 15:42:09 +0000
+Subject: [PATCH 1/2] ixgbe driver support for XEN_PV/IOMMU cases
+
+We cannot dereference machine physical memory addresses.
+We therefore need to use dma_map_ops for packet buffers
+to be successfully transfered to the NIC. The dma_map_ops
+are implemented by swiotlb-xen that allocates a buffer
+contingous in machine address space. The symptom for this
+issue is the other NIC seeing empty packet buffers.
+
+No other driver code uses netmap_(re)load_map function calls.
+Since, I introduce a direction argument in these calls, it breaks
+the forcedeth driver. Since these function calls are actually
+empty macros, so I commented this out.
+---
+ LINUX/forcedeth_netmap.h     |    4 ++--
+ LINUX/ixgbe_netmap_linux.h   |   40 ++++++++++++++++++++++++----------------
+ sys/dev/netmap/netmap_kern.h |   10 ++++++++--
+ 3 files changed, 34 insertions(+), 20 deletions(-)
+
+diff --git a/LINUX/forcedeth_netmap.h b/LINUX/forcedeth_netmap.h
+index 89129ab..b90942c 100644
+--- a/LINUX/forcedeth_netmap.h
++++ b/LINUX/forcedeth_netmap.h
+@@ -371,8 +371,8 @@ forcedeth_netmap_rx_init(struct SOFTC_T *np)
+ 		int l = netmap_idx_n2k(&na->rx_rings[0], i);
+ 
+ 		addr = PNMB(slot + l, &paddr);
+-		netmap_reload_map(np->rl_ldata.rl_rx_mtag,
+-		    np->rl_ldata.rl_rx_desc[i].rx_dmamap, addr);
++		//netmap_reload_map(np->rl_ldata.rl_rx_mtag,
++		//    np->rl_ldata.rl_rx_desc[i].rx_dmamap, addr);
+ 		desc[i].bufhigh = htole32(dma_high(paddr));
+ 		desc[i].buflow = htole32(dma_low(paddr));
+ 		cmdstat = NETMAP_BUF_SIZE;
+diff --git a/LINUX/ixgbe_netmap_linux.h b/LINUX/ixgbe_netmap_linux.h
+index 8db3e13..2680467 100644
+--- a/LINUX/ixgbe_netmap_linux.h
++++ b/LINUX/ixgbe_netmap_linux.h
+@@ -178,12 +178,14 @@ ixgbe_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+ 			int flags = (slot->flags & NS_REPORT ||
+ 				nic_i == 0 || nic_i == report_frequency) ?
+ 				IXGBE_TXD_CMD_RS : 0;
++			paddr = txr->tx_buffer_info[nm_i].dma;
+ 
+ 			NM_CHECK_ADDR_LEN(addr, len);
+ 
+ 			if (slot->flags & NS_BUF_CHANGED) {
+ 				/* buffer has changed, reload map */
+-				// netmap_reload_map(pdev, DMA_TO_DEVICE, old_addr, addr);
++				netmap_reload_map(txr->dev, txr->tx_buffer_info[nm_i].dma, addr, DMA_TO_DEVICE);
++				paddr = txr->tx_buffer_info[nm_i].dma;
+ 			}
+ 			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED);
+ 
+@@ -349,14 +351,15 @@ ixgbe_netmap_rxsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+ 			struct netmap_slot *slot = &ring->slot[nm_i];
+ 			uint64_t paddr;
+ 			void *addr = PNMB(slot, &paddr);
+-
+ 			union ixgbe_adv_rx_desc *curr = IXGBE_RX_DESC_ADV(rxr, nic_i);
++			paddr = rxr->rx_buffer_info[nm_i].dma;
+ 			if (addr == netmap_buffer_base) /* bad buf */
+ 				goto ring_reset;
+ 
+ 			if (slot->flags & NS_BUF_CHANGED) {
+ 				/* buffer has changed, reload map */
+-				// netmap_reload_map(pdev, DMA_TO_DEVICE, old_addr, addr);
++				netmap_reload_map(rxr->dev, rxr->rx_buffer_info[nm_i].dma, addr, DMA_FROM_DEVICE);
++				paddr = rxr->rx_buffer_info[nm_i].dma;
+ 				slot->flags &= ~NS_BUF_CHANGED;
+ 			}
+ 			curr->wb.upper.status_error = 0;
+@@ -394,7 +397,8 @@ ixgbe_netmap_configure_tx_ring(struct SOFTC_T *adapter, int ring_nr)
+ {
+ 	struct netmap_adapter *na = NA(adapter->netdev);
+ 	struct netmap_slot *slot;
+-	//int j;
++	struct ixgbe_ring *ring = adapter->tx_ring[ring_nr];
++	int lim, i;
+ 
+         if (!na || !(na->na_flags & NAF_NATIVE_ON)) {
+             return 0;
+@@ -403,19 +407,21 @@ ixgbe_netmap_configure_tx_ring(struct SOFTC_T *adapter, int ring_nr)
+         slot = netmap_reset(na, NR_TX, ring_nr, 0);
+ 	if (!slot)
+ 		return 0;	// not in netmap; XXX cannot happen
+-#if 0
+-	/*
+-	 * on a generic card we should set the address in the slot.
+-	 * But on the ixgbe, the address needs to be rewritten
+-	 * after a transmission so there is nothing do to except
+-	 * loading the map.
+-	 */
+-	for (j = 0; j < na->num_tx_desc; j++) {
+-		int sj = netmap_idx_n2k(&na->tx_rings[ring_nr], j);
++
++	lim = na->num_tx_desc - 1 - nm_kr_rxspace(&na->tx_rings[ring_nr]);
++
++	for (i = 0; i < na->num_tx_desc; i++) {
++		int sj = netmap_idx_n2k(&na->tx_rings[ring_nr], i);
++		struct ixgbe_tx_buffer *tx_buffer_info = &ring->tx_buffer_info[i];
+ 		uint64_t paddr;
+ 		void *addr = PNMB(slot + sj, &paddr);
++
++		netmap_load_map(ring->dev, tx_buffer_info->dma, addr, DMA_TO_DEVICE);
++
++		/* Update descriptor */
++		IXGBE_TX_DESC_ADV(ring, i)->read.buffer_addr = htole64(tx_buffer_info->dma);
+ 	}
+-#endif
++	IXGBE_WRITE_REG(&adapter->hw, IXGBE_RDT(ring_nr), lim);
+ 	return 1;
+ }
+ 
+@@ -463,8 +469,10 @@ ixgbe_netmap_configure_rx_ring(struct SOFTC_T *adapter, int ring_nr)
+ 		 */
+ 		int si = netmap_idx_n2k(&na->rx_rings[ring_nr], i);
+ 		uint64_t paddr;
+-		PNMB(slot + si, &paddr);
+-		// netmap_load_map(rxr->ptag, rxbuf->pmap, addr);
++		void *addr = PNMB(slot + si, &paddr);
++		struct ixgbe_rx_buffer *rx_buffer_info = &ring->rx_buffer_info[i];
++		netmap_load_map(ring->dev, rx_buffer_info->dma, addr, DMA_FROM_DEVICE);
++		paddr = rx_buffer_info->dma;
+ 		/* Update descriptor */
+ 		IXGBE_RX_DESC_ADV(ring, i)->read.pkt_addr = htole64(paddr);
+ 	}
+diff --git a/sys/dev/netmap/netmap_kern.h b/sys/dev/netmap/netmap_kern.h
+index c9db6e2..87dcb8a 100644
+--- a/sys/dev/netmap/netmap_kern.h
++++ b/sys/dev/netmap/netmap_kern.h
+@@ -1021,8 +1021,14 @@ netmap_reload_map(bus_dma_tag_t tag, bus_dmamap_t map, void *buf)
+  * unfortunately the direction is not, so we need to change
+  * something to have a cross API
+  */
+-#define netmap_load_map(_t, _m, _b)
+-#define netmap_reload_map(_t, _m, _b)
++#define netmap_load_map(_t, _m, _b, _d) \
++    _m = dma_map_single(_t, _b, NETMAP_BUF_SIZE, _d)
++
++#define netmap_reload_map(_t, _m, _b, _d) \
++    if (_m) \
++        dma_unmap_single(_t, _m, NETMAP_BUF_SIZE, _d); \
++    _m = dma_map_single(_t, _b, NETMAP_BUF_SIZE, _d)
++
+ #if 0
+ 	struct e1000_buffer *buffer_info =  &tx_ring->buffer_info[l];
+ 	/* set time_stamp *before* dma to help avoid a possible race */
+-- 
+1.7.10.4
+
