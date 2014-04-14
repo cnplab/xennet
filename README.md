@@ -43,6 +43,7 @@ $ cd -
 By default it compiles everything (netmap + netback/netfront)
 
 ```
+$ make KSRC=/usr/src/linux-source-X.X.X prepare
 $ make KSRC=/usr/src/linux-headers-X.X.X
 ```
 
