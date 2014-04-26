@@ -1,0 +1,1664 @@
+diff --git a/root/xen-netback/common.h b/LINUX/xen-netback/common.h
+index 6668d03..285cc15 100644
+--- a/root/xen-netback/common.h
++++ b/LINUX/xen-netback/common.h
+@@ -108,6 +108,20 @@ struct xenvif_rx_meta {
+  */
+ #define MAX_GRANT_COPY_OPS (MAX_SKB_FRAGS * XEN_NETIF_RX_RING_SIZE)
+ 
++#ifdef CONFIG_NETMAP
++struct nm_grant_ring {
++	struct page **ring_pg;
++	struct page **buf_pg;
++	int *ring_ref;
++	int *buf_ref;
++	unsigned int kring_pof;
++	uint16_t irq;
++	uint16_t port;
++	uint16_t nr_buf_pgs;
++	uint16_t nr_ring_pgs;
++};
++#endif
++
+ struct xenvif {
+ 	/* Unique identifier for this interface. */
+ 	domid_t          domid;
+@@ -176,6 +190,12 @@ struct xenvif {
+ 	/* Internal feature information. */
+ 	u8 can_queue:1;	    /* can queue packets for receiver? */
+ 
++#ifdef CONFIG_NETMAP
++	u8 netmap:1;
++	struct nm_grant_ring nmtx;
++	struct nm_grant_ring nmrx;
++#endif
++
+ 	/* Transmit shaping: allow 'credit_bytes' every 'credit_usec'. */
+ 	unsigned long   credit_bytes;
+ 	unsigned long   credit_usec;
+diff --git a/LINUX/xen-netback/common.h.orig b/LINUX/xen-netback/common.h.orig
+new file mode 100644
+index 0000000..6668d03
+--- /dev/null
++++ b/LINUX/xen-netback/common.h.orig
+@@ -0,0 +1,244 @@
++/*
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation; or, when distributed
++ * separately from the Linux kernel or incorporated into other
++ * software packages, subject to the following license:
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this source file (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use, copy, modify,
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#ifndef __XEN_NETBACK__COMMON_H__
++#define __XEN_NETBACK__COMMON_H__
++
++#define pr_fmt(fmt) KBUILD_MODNAME ":%s: " fmt, __func__
++
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/slab.h>
++#include <linux/ip.h>
++#include <linux/in.h>
++#include <linux/io.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++
++#include <xen/interface/io/netif.h>
++#include <xen/interface/grant_table.h>
++#include <xen/grant_table.h>
++#include <xen/xenbus.h>
++
++typedef unsigned int pending_ring_idx_t;
++#define INVALID_PENDING_RING_IDX (~0U)
++
++/* For the head field in pending_tx_info: it is used to indicate
++ * whether this tx info is the head of one or more coalesced requests.
++ *
++ * When head != INVALID_PENDING_RING_IDX, it means the start of a new
++ * tx requests queue and the end of previous queue.
++ *
++ * An example sequence of head fields (I = INVALID_PENDING_RING_IDX):
++ *
++ * ...|0 I I I|5 I|9 I I I|...
++ * -->|<-INUSE----------------
++ *
++ * After consuming the first slot(s) we have:
++ *
++ * ...|V V V V|5 I|9 I I I|...
++ * -----FREE->|<-INUSE--------
++ *
++ * where V stands for "valid pending ring index". Any number other
++ * than INVALID_PENDING_RING_IDX is OK. These entries are considered
++ * free and can contain any number other than
++ * INVALID_PENDING_RING_IDX. In practice we use 0.
++ *
++ * The in use non-INVALID_PENDING_RING_IDX (say 0, 5 and 9 in the
++ * above example) number is the index into pending_tx_info and
++ * mmap_pages arrays.
++ */
++struct pending_tx_info {
++	struct xen_netif_tx_request req; /* coalesced tx request */
++	pending_ring_idx_t head; /* head != INVALID_PENDING_RING_IDX
++				  * if it is head of one or more tx
++				  * reqs
++				  */
++};
++
++#define XEN_NETIF_TX_RING_SIZE __CONST_RING_SIZE(xen_netif_tx, PAGE_SIZE)
++#define XEN_NETIF_RX_RING_SIZE __CONST_RING_SIZE(xen_netif_rx, PAGE_SIZE)
++
++struct xenvif_rx_meta {
++	int id;
++	int size;
++	int gso_type;
++	int gso_size;
++};
++
++#define GSO_BIT(type) \
++	(1 << XEN_NETIF_GSO_TYPE_ ## type)
++
++/* Discriminate from any valid pending_idx value. */
++#define INVALID_PENDING_IDX 0xFFFF
++
++#define MAX_BUFFER_OFFSET PAGE_SIZE
++
++#define MAX_PENDING_REQS 256
++
++/* It's possible for an skb to have a maximal number of frags
++ * but still be less than MAX_BUFFER_OFFSET in size. Thus the
++ * worst-case number of copy operations is MAX_SKB_FRAGS per
++ * ring slot.
++ */
++#define MAX_GRANT_COPY_OPS (MAX_SKB_FRAGS * XEN_NETIF_RX_RING_SIZE)
++
++struct xenvif {
++	/* Unique identifier for this interface. */
++	domid_t          domid;
++	unsigned int     handle;
++
++	/* Is this interface disabled? True when backend discovers
++	 * frontend is rogue.
++	 */
++	bool disabled;
++
++	/* Use NAPI for guest TX */
++	struct napi_struct napi;
++	/* When feature-split-event-channels = 0, tx_irq = rx_irq. */
++	unsigned int tx_irq;
++	/* Only used when feature-split-event-channels = 1 */
++	char tx_irq_name[IFNAMSIZ+4]; /* DEVNAME-tx */
++	struct xen_netif_tx_back_ring tx;
++	struct sk_buff_head tx_queue;
++	struct page *mmap_pages[MAX_PENDING_REQS];
++	pending_ring_idx_t pending_prod;
++	pending_ring_idx_t pending_cons;
++	u16 pending_ring[MAX_PENDING_REQS];
++	struct pending_tx_info pending_tx_info[MAX_PENDING_REQS];
++
++	/* Coalescing tx requests before copying makes number of grant
++	 * copy ops greater or equal to number of slots required. In
++	 * worst case a tx request consumes 2 gnttab_copy.
++	 */
++	struct gnttab_copy tx_copy_ops[2*MAX_PENDING_REQS];
++
++
++	/* Use kthread for guest RX */
++	struct task_struct *task;
++	wait_queue_head_t wq;
++	/* When feature-split-event-channels = 0, tx_irq = rx_irq. */
++	unsigned int rx_irq;
++	/* Only used when feature-split-event-channels = 1 */
++	char rx_irq_name[IFNAMSIZ+4]; /* DEVNAME-rx */
++	struct xen_netif_rx_back_ring rx;
++	struct sk_buff_head rx_queue;
++
++	/* Allow xenvif_start_xmit() to peek ahead in the rx request
++	 * ring.  This is a prediction of what rx_req_cons will be
++	 * once all queued skbs are put on the ring.
++	 */
++	RING_IDX rx_req_cons_peek;
++
++	/* This array is allocated seperately as it is large */
++	struct gnttab_copy *grant_copy_op;
++
++	/* We create one meta structure per ring request we consume, so
++	 * the maximum number is the same as the ring size.
++	 */
++	struct xenvif_rx_meta meta[XEN_NETIF_RX_RING_SIZE];
++
++	u8               fe_dev_addr[6];
++
++	/* Frontend feature information. */
++	int gso_mask;
++	int gso_prefix_mask;
++
++	u8 can_sg:1;
++	u8 ip_csum:1;
++	u8 ipv6_csum:1;
++
++	/* Internal feature information. */
++	u8 can_queue:1;	    /* can queue packets for receiver? */
++
++	/* Transmit shaping: allow 'credit_bytes' every 'credit_usec'. */
++	unsigned long   credit_bytes;
++	unsigned long   credit_usec;
++	unsigned long   remaining_credit;
++	struct timer_list credit_timeout;
++	u64 credit_window_start;
++
++	/* Statistics */
++	unsigned long rx_gso_checksum_fixup;
++
++	/* Miscellaneous private stuff. */
++	struct net_device *dev;
++};
++
++static inline struct xenbus_device *xenvif_to_xenbus_device(struct xenvif *vif)
++{
++	return to_xenbus_device(vif->dev->dev.parent);
++}
++
++struct xenvif *xenvif_alloc(struct device *parent,
++			    domid_t domid,
++			    unsigned int handle);
++
++int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
++		   unsigned long rx_ring_ref, unsigned int tx_evtchn,
++		   unsigned int rx_evtchn);
++void xenvif_disconnect(struct xenvif *vif);
++void xenvif_free(struct xenvif *vif);
++
++int xenvif_xenbus_init(void);
++void xenvif_xenbus_fini(void);
++
++int xenvif_schedulable(struct xenvif *vif);
++
++int xenvif_rx_ring_full(struct xenvif *vif);
++
++int xenvif_must_stop_queue(struct xenvif *vif);
++
++/* (Un)Map communication rings. */
++void xenvif_unmap_frontend_rings(struct xenvif *vif);
++int xenvif_map_frontend_rings(struct xenvif *vif,
++			      grant_ref_t tx_ring_ref,
++			      grant_ref_t rx_ring_ref);
++
++/* Check for SKBs from frontend and schedule backend processing */
++void xenvif_check_rx_xenvif(struct xenvif *vif);
++
++/* Queue an SKB for transmission to the frontend */
++void xenvif_queue_tx_skb(struct xenvif *vif, struct sk_buff *skb);
++/* Notify xenvif that ring now has space to send an skb to the frontend */
++void xenvif_notify_tx_completion(struct xenvif *vif);
++
++/* Prevent the device from generating any further traffic. */
++void xenvif_carrier_off(struct xenvif *vif);
++
++/* Returns number of ring slots required to send an skb to the frontend */
++unsigned int xenvif_count_skb_slots(struct xenvif *vif, struct sk_buff *skb);
++
++int xenvif_tx_action(struct xenvif *vif, int budget);
++void xenvif_rx_action(struct xenvif *vif);
++
++int xenvif_kthread(void *data);
++
++extern bool separate_tx_rx_irq;
++
++#endif /* __XEN_NETBACK__COMMON_H__ */
+diff --git a/root/xen-netback/interface.c b/LINUX/xen-netback/interface.c
+index a2ef2e6..bdc8f9b 100644
+--- a/root/xen-netback/interface.c
++++ b/LINUX/xen-netback/interface.c
+@@ -39,6 +39,10 @@
+ #include <xen/events.h>
+ #include <asm/xen/hypercall.h>
+ 
++#if defined(CONFIG_NETMAP) || defined(CONFIG_NETMAP_MODULE)
++#include <netback_netmap_linux.h>
++#endif
++
+ #define XENVIF_QUEUE_LENGTH 32
+ #define XENVIF_NAPI_WEIGHT  64
+ 
+@@ -55,6 +59,12 @@ static int xenvif_rx_schedulable(struct xenvif *vif)
+ static irqreturn_t xenvif_tx_interrupt(int irq, void *dev_id)
+ {
+ 	struct xenvif *vif = dev_id;
++#ifdef CONFIG_NETMAP
++	if (vif->netmap) {
++		xenvif_netmap_irqsched(vif, 1);
++		return IRQ_HANDLED;
++	}
++#endif /* CONFIG_NETMAP */
+ 
+ 	if (RING_HAS_UNCONSUMED_REQUESTS(&vif->tx))
+ 		napi_schedule(&vif->napi);
+@@ -114,6 +124,13 @@ static irqreturn_t xenvif_rx_interrupt(int irq, void *dev_id)
+ {
+ 	struct xenvif *vif = dev_id;
+ 
++#ifdef CONFIG_NETMAP
++	if (vif->netmap) {
++		xenvif_netmap_irqsched(vif, 0);
++		return IRQ_HANDLED;
++	}
++#endif /* CONFIG_NETMAP */
++
+ 	if (xenvif_rx_schedulable(vif))
+ 		netif_wake_queue(vif->dev);
+ 
+@@ -172,6 +189,10 @@ static struct net_device_stats *xenvif_get_stats(struct net_device *dev)
+ 
+ static void xenvif_up(struct xenvif *vif)
+ {
++#ifdef CONFIG_NETMAP
++	if (vif->netmap)
++		return xenvif_netmap_up(vif);
++#endif
+ 	napi_enable(&vif->napi);
+ 	enable_irq(vif->tx_irq);
+ 	if (vif->tx_irq != vif->rx_irq)
+@@ -181,6 +202,10 @@ static void xenvif_up(struct xenvif *vif)
+ 
+ static void xenvif_down(struct xenvif *vif)
+ {
++#ifdef CONFIG_NETMAP
++	if (vif->netmap)
++		return xenvif_netmap_down(vif);
++#endif
+ 	napi_disable(&vif->napi);
+ 	disable_irq(vif->tx_irq);
+ 	if (vif->tx_irq != vif->rx_irq)
+@@ -378,6 +403,10 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
+ 		return ERR_PTR(err);
+ 	}
+ 
++#ifdef CONFIG_NETMAP
++	xenvif_netmap_attach(vif);
++#endif
++
+ 	netdev_dbg(dev, "Successfully created xenvif\n");
+ 
+ 	__module_get(THIS_MODULE);
+@@ -395,9 +424,11 @@ int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
+ 	BUG_ON(vif->tx_irq);
+ 	BUG_ON(vif->task);
+ 
+-	err = xenvif_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
+-	if (err < 0)
+-		goto err;
++	if (!vif->netmap) {
++		err = xenvif_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
++		if (err < 0)
++			goto err;
++	}
+ 
+ 	if (tx_evtchn == rx_evtchn) {
+ 		/* feature-split-event-channels == 0 */
+@@ -432,8 +463,8 @@ int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
+ 	}
+ 
+ 	init_waitqueue_head(&vif->wq);
+-	task = kthread_create(xenvif_kthread,
+-			      (void *)vif, "%s", vif->dev->name);
++	task = kthread_create((!vif->netmap ? xenvif_kthread :
++		xenvif_netmap_kthread), (void *)vif, "%s", vif->dev->name);
+ 	if (IS_ERR(task)) {
+ 		pr_warn("Could not allocate kthread for %s\n", vif->dev->name);
+ 		err = PTR_ERR(task);
+@@ -506,6 +537,9 @@ void xenvif_free(struct xenvif *vif)
+ {
+ 	netif_napi_del(&vif->napi);
+ 
++#ifdef CONFIG_NETMAP
++	xenvif_netmap_detach(vif);
++#endif
+ 	unregister_netdev(vif->dev);
+ 
+ 	vfree(vif->grant_copy_op);
+diff --git a/LINUX/xen-netback/interface.c.orig b/LINUX/xen-netback/interface.c.orig
+new file mode 100644
+index 0000000..a2ef2e6
+--- /dev/null
++++ b/LINUX/xen-netback/interface.c.orig
+@@ -0,0 +1,515 @@
++/*
++ * Network-device interface management.
++ *
++ * Copyright (c) 2004-2005, Keir Fraser
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation; or, when distributed
++ * separately from the Linux kernel or incorporated into other
++ * software packages, subject to the following license:
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this source file (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use, copy, modify,
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ */
++
++#include "common.h"
++
++#include <linux/kthread.h>
++#include <linux/ethtool.h>
++#include <linux/rtnetlink.h>
++#include <linux/if_vlan.h>
++#include <linux/vmalloc.h>
++
++#include <xen/events.h>
++#include <asm/xen/hypercall.h>
++
++#define XENVIF_QUEUE_LENGTH 32
++#define XENVIF_NAPI_WEIGHT  64
++
++int xenvif_schedulable(struct xenvif *vif)
++{
++	return netif_running(vif->dev) && netif_carrier_ok(vif->dev);
++}
++
++static int xenvif_rx_schedulable(struct xenvif *vif)
++{
++	return xenvif_schedulable(vif) && !xenvif_rx_ring_full(vif);
++}
++
++static irqreturn_t xenvif_tx_interrupt(int irq, void *dev_id)
++{
++	struct xenvif *vif = dev_id;
++
++	if (RING_HAS_UNCONSUMED_REQUESTS(&vif->tx))
++		napi_schedule(&vif->napi);
++
++	return IRQ_HANDLED;
++}
++
++static int xenvif_poll(struct napi_struct *napi, int budget)
++{
++	struct xenvif *vif = container_of(napi, struct xenvif, napi);
++	int work_done;
++
++	/* This vif is rogue, we pretend we've there is nothing to do
++	 * for this vif to deschedule it from NAPI. But this interface
++	 * will be turned off in thread context later.
++	 */
++	if (unlikely(vif->disabled)) {
++		napi_complete(napi);
++		return 0;
++	}
++
++	work_done = xenvif_tx_action(vif, budget);
++
++	if (work_done < budget) {
++		int more_to_do = 0;
++		unsigned long flags;
++
++		/* It is necessary to disable IRQ before calling
++		 * RING_HAS_UNCONSUMED_REQUESTS. Otherwise we might
++		 * lose event from the frontend.
++		 *
++		 * Consider:
++		 *   RING_HAS_UNCONSUMED_REQUESTS
++		 *   <frontend generates event to trigger napi_schedule>
++		 *   __napi_complete
++		 *
++		 * This handler is still in scheduled state so the
++		 * event has no effect at all. After __napi_complete
++		 * this handler is descheduled and cannot get
++		 * scheduled again. We lose event in this case and the ring
++		 * will be completely stalled.
++		 */
++
++		local_irq_save(flags);
++
++		RING_FINAL_CHECK_FOR_REQUESTS(&vif->tx, more_to_do);
++		if (!more_to_do)
++			__napi_complete(napi);
++
++		local_irq_restore(flags);
++	}
++
++	return work_done;
++}
++
++static irqreturn_t xenvif_rx_interrupt(int irq, void *dev_id)
++{
++	struct xenvif *vif = dev_id;
++
++	if (xenvif_rx_schedulable(vif))
++		netif_wake_queue(vif->dev);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t xenvif_interrupt(int irq, void *dev_id)
++{
++	xenvif_tx_interrupt(irq, dev_id);
++	xenvif_rx_interrupt(irq, dev_id);
++
++	return IRQ_HANDLED;
++}
++
++static int xenvif_start_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct xenvif *vif = netdev_priv(dev);
++
++	BUG_ON(skb->dev != dev);
++
++	/* Drop the packet if vif is not ready */
++	if (vif->task == NULL)
++		goto drop;
++
++	/* Drop the packet if the target domain has no receive buffers. */
++	if (!xenvif_rx_schedulable(vif))
++		goto drop;
++
++	/* Reserve ring slots for the worst-case number of fragments. */
++	vif->rx_req_cons_peek += xenvif_count_skb_slots(vif, skb);
++
++	if (vif->can_queue && xenvif_must_stop_queue(vif))
++		netif_stop_queue(dev);
++
++	xenvif_queue_tx_skb(vif, skb);
++
++	return NETDEV_TX_OK;
++
++ drop:
++	vif->dev->stats.tx_dropped++;
++	dev_kfree_skb(skb);
++	return NETDEV_TX_OK;
++}
++
++void xenvif_notify_tx_completion(struct xenvif *vif)
++{
++	if (netif_queue_stopped(vif->dev) && xenvif_rx_schedulable(vif))
++		netif_wake_queue(vif->dev);
++}
++
++static struct net_device_stats *xenvif_get_stats(struct net_device *dev)
++{
++	struct xenvif *vif = netdev_priv(dev);
++	return &vif->dev->stats;
++}
++
++static void xenvif_up(struct xenvif *vif)
++{
++	napi_enable(&vif->napi);
++	enable_irq(vif->tx_irq);
++	if (vif->tx_irq != vif->rx_irq)
++		enable_irq(vif->rx_irq);
++	xenvif_check_rx_xenvif(vif);
++}
++
++static void xenvif_down(struct xenvif *vif)
++{
++	napi_disable(&vif->napi);
++	disable_irq(vif->tx_irq);
++	if (vif->tx_irq != vif->rx_irq)
++		disable_irq(vif->rx_irq);
++	del_timer_sync(&vif->credit_timeout);
++}
++
++static int xenvif_open(struct net_device *dev)
++{
++	struct xenvif *vif = netdev_priv(dev);
++	if (netif_carrier_ok(dev))
++		xenvif_up(vif);
++	netif_start_queue(dev);
++	return 0;
++}
++
++static int xenvif_close(struct net_device *dev)
++{
++	struct xenvif *vif = netdev_priv(dev);
++	if (netif_carrier_ok(dev))
++		xenvif_down(vif);
++	netif_stop_queue(dev);
++	return 0;
++}
++
++static int xenvif_change_mtu(struct net_device *dev, int mtu)
++{
++	struct xenvif *vif = netdev_priv(dev);
++	int max = vif->can_sg ? 65535 - VLAN_ETH_HLEN : ETH_DATA_LEN;
++
++	if (mtu > max)
++		return -EINVAL;
++	dev->mtu = mtu;
++	return 0;
++}
++
++static netdev_features_t xenvif_fix_features(struct net_device *dev,
++	netdev_features_t features)
++{
++	struct xenvif *vif = netdev_priv(dev);
++
++	if (!vif->can_sg)
++		features &= ~NETIF_F_SG;
++	if (~(vif->gso_mask | vif->gso_prefix_mask) & GSO_BIT(TCPV4))
++		features &= ~NETIF_F_TSO;
++	if (~(vif->gso_mask | vif->gso_prefix_mask) & GSO_BIT(TCPV6))
++		features &= ~NETIF_F_TSO6;
++	if (!vif->ip_csum)
++		features &= ~NETIF_F_IP_CSUM;
++	if (!vif->ipv6_csum)
++		features &= ~NETIF_F_IPV6_CSUM;
++
++	return features;
++}
++
++static const struct xenvif_stat {
++	char name[ETH_GSTRING_LEN];
++	u16 offset;
++} xenvif_stats[] = {
++	{
++		"rx_gso_checksum_fixup",
++		offsetof(struct xenvif, rx_gso_checksum_fixup)
++	},
++};
++
++static int xenvif_get_sset_count(struct net_device *dev, int string_set)
++{
++	switch (string_set) {
++	case ETH_SS_STATS:
++		return ARRAY_SIZE(xenvif_stats);
++	default:
++		return -EINVAL;
++	}
++}
++
++static void xenvif_get_ethtool_stats(struct net_device *dev,
++				     struct ethtool_stats *stats, u64 * data)
++{
++	void *vif = netdev_priv(dev);
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(xenvif_stats); i++)
++		data[i] = *(unsigned long *)(vif + xenvif_stats[i].offset);
++}
++
++static void xenvif_get_strings(struct net_device *dev, u32 stringset, u8 * data)
++{
++	int i;
++
++	switch (stringset) {
++	case ETH_SS_STATS:
++		for (i = 0; i < ARRAY_SIZE(xenvif_stats); i++)
++			memcpy(data + i * ETH_GSTRING_LEN,
++			       xenvif_stats[i].name, ETH_GSTRING_LEN);
++		break;
++	}
++}
++
++static const struct ethtool_ops xenvif_ethtool_ops = {
++	.get_link	= ethtool_op_get_link,
++
++	.get_sset_count = xenvif_get_sset_count,
++	.get_ethtool_stats = xenvif_get_ethtool_stats,
++	.get_strings = xenvif_get_strings,
++};
++
++static const struct net_device_ops xenvif_netdev_ops = {
++	.ndo_start_xmit	= xenvif_start_xmit,
++	.ndo_get_stats	= xenvif_get_stats,
++	.ndo_open	= xenvif_open,
++	.ndo_stop	= xenvif_close,
++	.ndo_change_mtu	= xenvif_change_mtu,
++	.ndo_fix_features = xenvif_fix_features,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr   = eth_validate_addr,
++};
++
++struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
++			    unsigned int handle)
++{
++	int err;
++	struct net_device *dev;
++	struct xenvif *vif;
++	char name[IFNAMSIZ] = {};
++	int i;
++
++	snprintf(name, IFNAMSIZ - 1, "vif%u.%u", domid, handle);
++	dev = alloc_netdev(sizeof(struct xenvif), name, ether_setup);
++	if (dev == NULL) {
++		pr_warn("Could not allocate netdev for %s\n", name);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	SET_NETDEV_DEV(dev, parent);
++
++	vif = netdev_priv(dev);
++
++	vif->grant_copy_op = vmalloc(sizeof(struct gnttab_copy) *
++				     MAX_GRANT_COPY_OPS);
++	if (vif->grant_copy_op == NULL) {
++		pr_warn("Could not allocate grant copy space for %s\n", name);
++		free_netdev(dev);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	vif->domid  = domid;
++	vif->handle = handle;
++	vif->can_sg = 1;
++	vif->ip_csum = 1;
++	vif->dev = dev;
++
++	vif->disabled = false;
++
++	vif->credit_bytes = vif->remaining_credit = ~0UL;
++	vif->credit_usec  = 0UL;
++	init_timer(&vif->credit_timeout);
++	vif->credit_window_start = get_jiffies_64();
++
++	dev->netdev_ops	= &xenvif_netdev_ops;
++	dev->hw_features = NETIF_F_SG |
++		NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
++		NETIF_F_TSO | NETIF_F_TSO6;
++	dev->features = dev->hw_features | NETIF_F_RXCSUM;
++	SET_ETHTOOL_OPS(dev, &xenvif_ethtool_ops);
++
++	dev->tx_queue_len = XENVIF_QUEUE_LENGTH;
++
++	skb_queue_head_init(&vif->rx_queue);
++	skb_queue_head_init(&vif->tx_queue);
++
++	vif->pending_cons = 0;
++	vif->pending_prod = MAX_PENDING_REQS;
++	for (i = 0; i < MAX_PENDING_REQS; i++)
++		vif->pending_ring[i] = i;
++	for (i = 0; i < MAX_PENDING_REQS; i++)
++		vif->mmap_pages[i] = NULL;
++
++	/*
++	 * Initialise a dummy MAC address. We choose the numerically
++	 * largest non-broadcast address to prevent the address getting
++	 * stolen by an Ethernet bridge for STP purposes.
++	 * (FE:FF:FF:FF:FF:FF)
++	 */
++	memset(dev->dev_addr, 0xFF, ETH_ALEN);
++	dev->dev_addr[0] &= ~0x01;
++
++	netif_napi_add(dev, &vif->napi, xenvif_poll, XENVIF_NAPI_WEIGHT);
++
++	netif_carrier_off(dev);
++
++	err = register_netdev(dev);
++	if (err) {
++		netdev_warn(dev, "Could not register device: err=%d\n", err);
++		free_netdev(dev);
++		return ERR_PTR(err);
++	}
++
++	netdev_dbg(dev, "Successfully created xenvif\n");
++
++	__module_get(THIS_MODULE);
++
++	return vif;
++}
++
++int xenvif_connect(struct xenvif *vif, unsigned long tx_ring_ref,
++		   unsigned long rx_ring_ref, unsigned int tx_evtchn,
++		   unsigned int rx_evtchn)
++{
++	struct task_struct *task;
++	int err = -ENOMEM;
++
++	BUG_ON(vif->tx_irq);
++	BUG_ON(vif->task);
++
++	err = xenvif_map_frontend_rings(vif, tx_ring_ref, rx_ring_ref);
++	if (err < 0)
++		goto err;
++
++	if (tx_evtchn == rx_evtchn) {
++		/* feature-split-event-channels == 0 */
++		err = bind_interdomain_evtchn_to_irqhandler(
++			vif->domid, tx_evtchn, xenvif_interrupt, 0,
++			vif->dev->name, vif);
++		if (err < 0)
++			goto err_unmap;
++		vif->tx_irq = vif->rx_irq = err;
++		disable_irq(vif->tx_irq);
++	} else {
++		/* feature-split-event-channels == 1 */
++		snprintf(vif->tx_irq_name, sizeof(vif->tx_irq_name),
++			 "%s-tx", vif->dev->name);
++		err = bind_interdomain_evtchn_to_irqhandler(
++			vif->domid, tx_evtchn, xenvif_tx_interrupt, 0,
++			vif->tx_irq_name, vif);
++		if (err < 0)
++			goto err_unmap;
++		vif->tx_irq = err;
++		disable_irq(vif->tx_irq);
++
++		snprintf(vif->rx_irq_name, sizeof(vif->rx_irq_name),
++			 "%s-rx", vif->dev->name);
++		err = bind_interdomain_evtchn_to_irqhandler(
++			vif->domid, rx_evtchn, xenvif_rx_interrupt, 0,
++			vif->rx_irq_name, vif);
++		if (err < 0)
++			goto err_tx_unbind;
++		vif->rx_irq = err;
++		disable_irq(vif->rx_irq);
++	}
++
++	init_waitqueue_head(&vif->wq);
++	task = kthread_create(xenvif_kthread,
++			      (void *)vif, "%s", vif->dev->name);
++	if (IS_ERR(task)) {
++		pr_warn("Could not allocate kthread for %s\n", vif->dev->name);
++		err = PTR_ERR(task);
++		goto err_rx_unbind;
++	}
++
++	vif->task = task;
++
++	rtnl_lock();
++	if (!vif->can_sg && vif->dev->mtu > ETH_DATA_LEN)
++		dev_set_mtu(vif->dev, ETH_DATA_LEN);
++	netdev_update_features(vif->dev);
++	netif_carrier_on(vif->dev);
++	if (netif_running(vif->dev))
++		xenvif_up(vif);
++	rtnl_unlock();
++
++	wake_up_process(vif->task);
++
++	return 0;
++
++err_rx_unbind:
++	unbind_from_irqhandler(vif->rx_irq, vif);
++	vif->rx_irq = 0;
++err_tx_unbind:
++	unbind_from_irqhandler(vif->tx_irq, vif);
++	vif->tx_irq = 0;
++err_unmap:
++	xenvif_unmap_frontend_rings(vif);
++err:
++	module_put(THIS_MODULE);
++	return err;
++}
++
++void xenvif_carrier_off(struct xenvif *vif)
++{
++	struct net_device *dev = vif->dev;
++
++	rtnl_lock();
++	netif_carrier_off(dev); /* discard queued packets */
++	if (netif_running(dev))
++		xenvif_down(vif);
++	rtnl_unlock();
++}
++
++void xenvif_disconnect(struct xenvif *vif)
++{
++	if (netif_carrier_ok(vif->dev))
++		xenvif_carrier_off(vif);
++
++	if (vif->task) {
++		kthread_stop(vif->task);
++		vif->task = NULL;
++	}
++
++	if (vif->tx_irq) {
++		if (vif->tx_irq == vif->rx_irq)
++			unbind_from_irqhandler(vif->tx_irq, vif);
++		else {
++			unbind_from_irqhandler(vif->tx_irq, vif);
++			unbind_from_irqhandler(vif->rx_irq, vif);
++		}
++		vif->tx_irq = 0;
++	}
++
++	xenvif_unmap_frontend_rings(vif);
++}
++
++void xenvif_free(struct xenvif *vif)
++{
++	netif_napi_del(&vif->napi);
++
++	unregister_netdev(vif->dev);
++
++	vfree(vif->grant_copy_op);
++	free_netdev(vif->dev);
++
++	module_put(THIS_MODULE);
++}
+diff --git a/LINUX/xen-netback/interface.c.rej b/LINUX/xen-netback/interface.c.rej
+new file mode 100644
+index 0000000..71e54b5
+--- /dev/null
++++ b/LINUX/xen-netback/interface.c.rej
+@@ -0,0 +1,13 @@
++--- usr/src/linux-source-3.12/drivers/net/xen-netback/interface.c
+++++ LINUX/xen-netback/interface.c
++@@ -436,8 +467,8 @@
++ 	}
++ 
++ 	init_waitqueue_head(&vif->wq);
++-	vif->task = kthread_create(xenvif_kthread,
++-				   (void *)vif, "%s", vif->dev->name);
+++	vif->task = kthread_create((!vif->netmap ? xenvif_kthread :
+++		xenvif_netmap_kthread), (void *)vif, "%s", vif->dev->name);
++ 	if (IS_ERR(vif->task)) {
++ 		pr_warn("Could not allocate kthread for %s\n", vif->dev->name);
++ 		err = PTR_ERR(vif->task);
+diff --git a/root/xen-netback/xenbus.c b/LINUX/xen-netback/xenbus.c
+index f035899..b827517 100644
+--- a/root/xen-netback/xenbus.c
++++ b/LINUX/xen-netback/xenbus.c
+@@ -92,6 +92,13 @@ static int netback_probe(struct xenbus_device *dev,
+ 			goto fail;
+ 		}
+ 
++#if CONFIG_NETMAP
++		err = xenbus_printf(xbt, dev->nodename, "feature-netmap", "%d", 0);
++		if (err) {
++			message = "writing feature-netmap";
++			goto abort_transaction;
++		}
++#endif
+ 		err = xenbus_printf(xbt, dev->nodename, "feature-sg", "%d", sg);
+ 		if (err) {
+ 			message = "writing feature-sg";
+@@ -521,10 +528,18 @@ static int connect_rings(struct backend_info *be)
+ 	int err;
+ 	int val;
+ 
++#ifdef CONFIG_NETMAP
++	if (xenbus_scanf(XBT_NIL, dev->nodename, "feature-netmap",
++				"%d", &val) < 0) {
++		val = 0;
++	}
++	vif->netmap = !!val;
++#endif
++
+ 	err = xenbus_gather(XBT_NIL, dev->otherend,
+ 			    "tx-ring-ref", "%lu", &tx_ring_ref,
+ 			    "rx-ring-ref", "%lu", &rx_ring_ref, NULL);
+-	if (err) {
++	if (err && !vif->netmap) {
+ 		xenbus_dev_fatal(dev, err,
+ 				 "reading %s/ring-ref",
+ 				 dev->otherend);
+@@ -547,6 +562,9 @@ static int connect_rings(struct backend_info *be)
+ 		rx_evtchn = tx_evtchn;
+ 	}
+ 
++	if (vif->netmap)
++		goto skip_features;
++
+ 	err = xenbus_scanf(XBT_NIL, dev->otherend, "request-rx-copy", "%u",
+ 			   &rx_copy);
+ 	if (err == -ENOENT) {
+@@ -622,6 +640,7 @@ static int connect_rings(struct backend_info *be)
+ 		val = 0;
+ 	vif->ipv6_csum = !!val;
+ 
++skip_features:
+ 	/* Map the shared frame, irq etc. */
+ 	err = xenvif_connect(vif, tx_ring_ref, rx_ring_ref,
+ 			     tx_evtchn, rx_evtchn);
+diff --git a/LINUX/xen-netback/xenbus.c.orig b/LINUX/xen-netback/xenbus.c.orig
+new file mode 100644
+index 0000000..f035899
+--- /dev/null
++++ b/LINUX/xen-netback/xenbus.c.orig
+@@ -0,0 +1,663 @@
++/*
++ * Xenbus code for netif backend
++ *
++ * Copyright (C) 2005 Rusty Russell <rusty@rustcorp.com.au>
++ * Copyright (C) 2005 XenSource Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++*/
++
++#include "common.h"
++
++struct backend_info {
++	struct xenbus_device *dev;
++	struct xenvif *vif;
++
++	/* This is the state that will be reflected in xenstore when any
++	 * active hotplug script completes.
++	 */
++	enum xenbus_state state;
++
++	enum xenbus_state frontend_state;
++	struct xenbus_watch hotplug_status_watch;
++	u8 have_hotplug_status_watch:1;
++};
++
++static int connect_rings(struct backend_info *);
++static void connect(struct backend_info *);
++static void backend_create_xenvif(struct backend_info *be);
++static void unregister_hotplug_status_watch(struct backend_info *be);
++static void set_backend_state(struct backend_info *be,
++			      enum xenbus_state state);
++
++static int netback_remove(struct xenbus_device *dev)
++{
++	struct backend_info *be = dev_get_drvdata(&dev->dev);
++
++	set_backend_state(be, XenbusStateClosed);
++
++	unregister_hotplug_status_watch(be);
++	if (be->vif) {
++		kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
++		xenbus_rm(XBT_NIL, dev->nodename, "hotplug-status");
++		xenvif_free(be->vif);
++		be->vif = NULL;
++	}
++	kfree(be);
++	dev_set_drvdata(&dev->dev, NULL);
++	return 0;
++}
++
++
++/**
++ * Entry point to this code when a new device is created.  Allocate the basic
++ * structures and switch to InitWait.
++ */
++static int netback_probe(struct xenbus_device *dev,
++			 const struct xenbus_device_id *id)
++{
++	const char *message;
++	struct xenbus_transaction xbt;
++	int err;
++	int sg;
++	struct backend_info *be = kzalloc(sizeof(struct backend_info),
++					  GFP_KERNEL);
++	if (!be) {
++		xenbus_dev_fatal(dev, -ENOMEM,
++				 "allocating backend structure");
++		return -ENOMEM;
++	}
++
++	be->dev = dev;
++	dev_set_drvdata(&dev->dev, be);
++
++	sg = 1;
++
++	do {
++		err = xenbus_transaction_start(&xbt);
++		if (err) {
++			xenbus_dev_fatal(dev, err, "starting transaction");
++			goto fail;
++		}
++
++		err = xenbus_printf(xbt, dev->nodename, "feature-sg", "%d", sg);
++		if (err) {
++			message = "writing feature-sg";
++			goto abort_transaction;
++		}
++
++		err = xenbus_printf(xbt, dev->nodename, "feature-gso-tcpv4",
++				    "%d", sg);
++		if (err) {
++			message = "writing feature-gso-tcpv4";
++			goto abort_transaction;
++		}
++
++		err = xenbus_printf(xbt, dev->nodename, "feature-gso-tcpv6",
++				    "%d", sg);
++		if (err) {
++			message = "writing feature-gso-tcpv6";
++			goto abort_transaction;
++		}
++
++		/* We support partial checksum setup for IPv6 packets */
++		err = xenbus_printf(xbt, dev->nodename,
++				    "feature-ipv6-csum-offload",
++				    "%d", 1);
++		if (err) {
++			message = "writing feature-ipv6-csum-offload";
++			goto abort_transaction;
++		}
++
++		/* We support rx-copy path. */
++		err = xenbus_printf(xbt, dev->nodename,
++				    "feature-rx-copy", "%d", 1);
++		if (err) {
++			message = "writing feature-rx-copy";
++			goto abort_transaction;
++		}
++
++		/*
++		 * We don't support rx-flip path (except old guests who don't
++		 * grok this feature flag).
++		 */
++		err = xenbus_printf(xbt, dev->nodename,
++				    "feature-rx-flip", "%d", 0);
++		if (err) {
++			message = "writing feature-rx-flip";
++			goto abort_transaction;
++		}
++
++		err = xenbus_transaction_end(xbt, 0);
++	} while (err == -EAGAIN);
++
++	if (err) {
++		xenbus_dev_fatal(dev, err, "completing transaction");
++		goto fail;
++	}
++
++	/*
++	 * Split event channels support, this is optional so it is not
++	 * put inside the above loop.
++	 */
++	err = xenbus_printf(XBT_NIL, dev->nodename,
++			    "feature-split-event-channels",
++			    "%u", separate_tx_rx_irq);
++	if (err)
++		pr_debug("Error writing feature-split-event-channels\n");
++
++	err = xenbus_switch_state(dev, XenbusStateInitWait);
++	if (err)
++		goto fail;
++
++	be->state = XenbusStateInitWait;
++
++	/* This kicks hotplug scripts, so do it immediately. */
++	backend_create_xenvif(be);
++
++	return 0;
++
++abort_transaction:
++	xenbus_transaction_end(xbt, 1);
++	xenbus_dev_fatal(dev, err, "%s", message);
++fail:
++	pr_debug("failed\n");
++	netback_remove(dev);
++	return err;
++}
++
++
++/*
++ * Handle the creation of the hotplug script environment.  We add the script
++ * and vif variables to the environment, for the benefit of the vif-* hotplug
++ * scripts.
++ */
++static int netback_uevent(struct xenbus_device *xdev,
++			  struct kobj_uevent_env *env)
++{
++	struct backend_info *be = dev_get_drvdata(&xdev->dev);
++	char *val;
++
++	val = xenbus_read(XBT_NIL, xdev->nodename, "script", NULL);
++	if (IS_ERR(val)) {
++		int err = PTR_ERR(val);
++		xenbus_dev_fatal(xdev, err, "reading script");
++		return err;
++	} else {
++		if (add_uevent_var(env, "script=%s", val)) {
++			kfree(val);
++			return -ENOMEM;
++		}
++		kfree(val);
++	}
++
++	if (!be || !be->vif)
++		return 0;
++
++	return add_uevent_var(env, "vif=%s", be->vif->dev->name);
++}
++
++
++static void backend_create_xenvif(struct backend_info *be)
++{
++	int err;
++	long handle;
++	struct xenbus_device *dev = be->dev;
++
++	if (be->vif != NULL)
++		return;
++
++	err = xenbus_scanf(XBT_NIL, dev->nodename, "handle", "%li", &handle);
++	if (err != 1) {
++		xenbus_dev_fatal(dev, err, "reading handle");
++		return;
++	}
++
++	be->vif = xenvif_alloc(&dev->dev, dev->otherend_id, handle);
++	if (IS_ERR(be->vif)) {
++		err = PTR_ERR(be->vif);
++		be->vif = NULL;
++		xenbus_dev_fatal(dev, err, "creating interface");
++		return;
++	}
++
++	kobject_uevent(&dev->dev.kobj, KOBJ_ONLINE);
++}
++
++static void backend_disconnect(struct backend_info *be)
++{
++	if (be->vif)
++		xenvif_disconnect(be->vif);
++}
++
++static void backend_connect(struct backend_info *be)
++{
++	if (be->vif)
++		connect(be);
++}
++
++static inline void backend_switch_state(struct backend_info *be,
++					enum xenbus_state state)
++{
++	struct xenbus_device *dev = be->dev;
++
++	pr_debug("%s -> %s\n", dev->nodename, xenbus_strstate(state));
++	be->state = state;
++
++	/* If we are waiting for a hotplug script then defer the
++	 * actual xenbus state change.
++	 */
++	if (!be->have_hotplug_status_watch)
++		xenbus_switch_state(dev, state);
++}
++
++/* Handle backend state transitions:
++ *
++ * The backend state starts in InitWait and the following transitions are
++ * allowed.
++ *
++ * InitWait -> Connected
++ *
++ *    ^    \         |
++ *    |     \        |
++ *    |      \       |
++ *    |       \      |
++ *    |        \     |
++ *    |         \    |
++ *    |          V   V
++ *
++ *  Closed  <-> Closing
++ *
++ * The state argument specifies the eventual state of the backend and the
++ * function transitions to that state via the shortest path.
++ */
++static void set_backend_state(struct backend_info *be,
++			      enum xenbus_state state)
++{
++	while (be->state != state) {
++		switch (be->state) {
++		case XenbusStateClosed:
++			switch (state) {
++			case XenbusStateInitWait:
++			case XenbusStateConnected:
++				pr_info("%s: prepare for reconnect\n",
++					be->dev->nodename);
++				backend_switch_state(be, XenbusStateInitWait);
++				break;
++			case XenbusStateClosing:
++				backend_switch_state(be, XenbusStateClosing);
++				break;
++			default:
++				BUG();
++			}
++			break;
++		case XenbusStateInitWait:
++			switch (state) {
++			case XenbusStateConnected:
++				backend_connect(be);
++				backend_switch_state(be, XenbusStateConnected);
++				break;
++			case XenbusStateClosing:
++			case XenbusStateClosed:
++				backend_switch_state(be, XenbusStateClosing);
++				break;
++			default:
++				BUG();
++			}
++			break;
++		case XenbusStateConnected:
++			switch (state) {
++			case XenbusStateInitWait:
++			case XenbusStateClosing:
++			case XenbusStateClosed:
++				backend_disconnect(be);
++				backend_switch_state(be, XenbusStateClosing);
++				break;
++			default:
++				BUG();
++			}
++			break;
++		case XenbusStateClosing:
++			switch (state) {
++			case XenbusStateInitWait:
++			case XenbusStateConnected:
++			case XenbusStateClosed:
++				backend_switch_state(be, XenbusStateClosed);
++				break;
++			default:
++				BUG();
++			}
++			break;
++		default:
++			BUG();
++		}
++	}
++}
++
++/**
++ * Callback received when the frontend's state changes.
++ */
++static void frontend_changed(struct xenbus_device *dev,
++			     enum xenbus_state frontend_state)
++{
++	struct backend_info *be = dev_get_drvdata(&dev->dev);
++
++	pr_debug("%s -> %s\n", dev->otherend, xenbus_strstate(frontend_state));
++
++	be->frontend_state = frontend_state;
++
++	switch (frontend_state) {
++	case XenbusStateInitialising:
++		set_backend_state(be, XenbusStateInitWait);
++		break;
++
++	case XenbusStateInitialised:
++		break;
++
++	case XenbusStateConnected:
++		set_backend_state(be, XenbusStateConnected);
++		break;
++
++	case XenbusStateClosing:
++		set_backend_state(be, XenbusStateClosing);
++		break;
++
++	case XenbusStateClosed:
++		set_backend_state(be, XenbusStateClosed);
++		if (xenbus_dev_is_online(dev))
++			break;
++		/* fall through if not online */
++	case XenbusStateUnknown:
++		set_backend_state(be, XenbusStateClosed);
++		device_unregister(&dev->dev);
++		break;
++
++	default:
++		xenbus_dev_fatal(dev, -EINVAL, "saw state %d at frontend",
++				 frontend_state);
++		break;
++	}
++}
++
++
++static void xen_net_read_rate(struct xenbus_device *dev,
++			      unsigned long *bytes, unsigned long *usec)
++{
++	char *s, *e;
++	unsigned long b, u;
++	char *ratestr;
++
++	/* Default to unlimited bandwidth. */
++	*bytes = ~0UL;
++	*usec = 0;
++
++	ratestr = xenbus_read(XBT_NIL, dev->nodename, "rate", NULL);
++	if (IS_ERR(ratestr))
++		return;
++
++	s = ratestr;
++	b = simple_strtoul(s, &e, 10);
++	if ((s == e) || (*e != ','))
++		goto fail;
++
++	s = e + 1;
++	u = simple_strtoul(s, &e, 10);
++	if ((s == e) || (*e != '\0'))
++		goto fail;
++
++	*bytes = b;
++	*usec = u;
++
++	kfree(ratestr);
++	return;
++
++ fail:
++	pr_warn("Failed to parse network rate limit. Traffic unlimited.\n");
++	kfree(ratestr);
++}
++
++static int xen_net_read_mac(struct xenbus_device *dev, u8 mac[])
++{
++	char *s, *e, *macstr;
++	int i;
++
++	macstr = s = xenbus_read(XBT_NIL, dev->nodename, "mac", NULL);
++	if (IS_ERR(macstr))
++		return PTR_ERR(macstr);
++
++	for (i = 0; i < ETH_ALEN; i++) {
++		mac[i] = simple_strtoul(s, &e, 16);
++		if ((s == e) || (*e != ((i == ETH_ALEN-1) ? '\0' : ':'))) {
++			kfree(macstr);
++			return -ENOENT;
++		}
++		s = e+1;
++	}
++
++	kfree(macstr);
++	return 0;
++}
++
++static void unregister_hotplug_status_watch(struct backend_info *be)
++{
++	if (be->have_hotplug_status_watch) {
++		unregister_xenbus_watch(&be->hotplug_status_watch);
++		kfree(be->hotplug_status_watch.node);
++	}
++	be->have_hotplug_status_watch = 0;
++}
++
++static void hotplug_status_changed(struct xenbus_watch *watch,
++				   const char **vec,
++				   unsigned int vec_size)
++{
++	struct backend_info *be = container_of(watch,
++					       struct backend_info,
++					       hotplug_status_watch);
++	char *str;
++	unsigned int len;
++
++	str = xenbus_read(XBT_NIL, be->dev->nodename, "hotplug-status", &len);
++	if (IS_ERR(str))
++		return;
++	if (len == sizeof("connected")-1 && !memcmp(str, "connected", len)) {
++		/* Complete any pending state change */
++		xenbus_switch_state(be->dev, be->state);
++
++		/* Not interested in this watch anymore. */
++		unregister_hotplug_status_watch(be);
++	}
++	kfree(str);
++}
++
++static void connect(struct backend_info *be)
++{
++	int err;
++	struct xenbus_device *dev = be->dev;
++
++	err = connect_rings(be);
++	if (err)
++		return;
++
++	err = xen_net_read_mac(dev, be->vif->fe_dev_addr);
++	if (err) {
++		xenbus_dev_fatal(dev, err, "parsing %s/mac", dev->nodename);
++		return;
++	}
++
++	xen_net_read_rate(dev, &be->vif->credit_bytes,
++			  &be->vif->credit_usec);
++	be->vif->remaining_credit = be->vif->credit_bytes;
++
++	unregister_hotplug_status_watch(be);
++	err = xenbus_watch_pathfmt(dev, &be->hotplug_status_watch,
++				   hotplug_status_changed,
++				   "%s/%s", dev->nodename, "hotplug-status");
++	if (!err)
++		be->have_hotplug_status_watch = 1;
++
++	netif_wake_queue(be->vif->dev);
++}
++
++
++static int connect_rings(struct backend_info *be)
++{
++	struct xenvif *vif = be->vif;
++	struct xenbus_device *dev = be->dev;
++	unsigned long tx_ring_ref, rx_ring_ref;
++	unsigned int tx_evtchn, rx_evtchn, rx_copy;
++	int err;
++	int val;
++
++	err = xenbus_gather(XBT_NIL, dev->otherend,
++			    "tx-ring-ref", "%lu", &tx_ring_ref,
++			    "rx-ring-ref", "%lu", &rx_ring_ref, NULL);
++	if (err) {
++		xenbus_dev_fatal(dev, err,
++				 "reading %s/ring-ref",
++				 dev->otherend);
++		return err;
++	}
++
++	/* Try split event channels first, then single event channel. */
++	err = xenbus_gather(XBT_NIL, dev->otherend,
++			    "event-channel-tx", "%u", &tx_evtchn,
++			    "event-channel-rx", "%u", &rx_evtchn, NULL);
++	if (err < 0) {
++		err = xenbus_scanf(XBT_NIL, dev->otherend,
++				   "event-channel", "%u", &tx_evtchn);
++		if (err < 0) {
++			xenbus_dev_fatal(dev, err,
++					 "reading %s/event-channel(-tx/rx)",
++					 dev->otherend);
++			return err;
++		}
++		rx_evtchn = tx_evtchn;
++	}
++
++	err = xenbus_scanf(XBT_NIL, dev->otherend, "request-rx-copy", "%u",
++			   &rx_copy);
++	if (err == -ENOENT) {
++		err = 0;
++		rx_copy = 0;
++	}
++	if (err < 0) {
++		xenbus_dev_fatal(dev, err, "reading %s/request-rx-copy",
++				 dev->otherend);
++		return err;
++	}
++	if (!rx_copy)
++		return -EOPNOTSUPP;
++
++	if (vif->dev->tx_queue_len != 0) {
++		if (xenbus_scanf(XBT_NIL, dev->otherend,
++				 "feature-rx-notify", "%d", &val) < 0)
++			val = 0;
++		if (val)
++			vif->can_queue = 1;
++		else
++			/* Must be non-zero for pfifo_fast to work. */
++			vif->dev->tx_queue_len = 1;
++	}
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-sg",
++			 "%d", &val) < 0)
++		val = 0;
++	vif->can_sg = !!val;
++
++	vif->gso_mask = 0;
++	vif->gso_prefix_mask = 0;
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-gso-tcpv4",
++			 "%d", &val) < 0)
++		val = 0;
++	if (val)
++		vif->gso_mask |= GSO_BIT(TCPV4);
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-gso-tcpv4-prefix",
++			 "%d", &val) < 0)
++		val = 0;
++	if (val)
++		vif->gso_prefix_mask |= GSO_BIT(TCPV4);
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-gso-tcpv6",
++			 "%d", &val) < 0)
++		val = 0;
++	if (val)
++		vif->gso_mask |= GSO_BIT(TCPV6);
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-gso-tcpv6-prefix",
++			 "%d", &val) < 0)
++		val = 0;
++	if (val)
++		vif->gso_prefix_mask |= GSO_BIT(TCPV6);
++
++	if (vif->gso_mask & vif->gso_prefix_mask) {
++		xenbus_dev_fatal(dev, err,
++				 "%s: gso and gso prefix flags are not "
++				 "mutually exclusive",
++				 dev->otherend);
++		return -EOPNOTSUPP;
++	}
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-no-csum-offload",
++			 "%d", &val) < 0)
++		val = 0;
++	vif->ip_csum = !val;
++
++	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-ipv6-csum-offload",
++			 "%d", &val) < 0)
++		val = 0;
++	vif->ipv6_csum = !!val;
++
++	/* Map the shared frame, irq etc. */
++	err = xenvif_connect(vif, tx_ring_ref, rx_ring_ref,
++			     tx_evtchn, rx_evtchn);
++	if (err) {
++		xenbus_dev_fatal(dev, err,
++				 "mapping shared-frames %lu/%lu port tx %u rx %u",
++				 tx_ring_ref, rx_ring_ref,
++				 tx_evtchn, rx_evtchn);
++		return err;
++	}
++	return 0;
++}
++
++
++/* ** Driver Registration ** */
++
++
++static const struct xenbus_device_id netback_ids[] = {
++	{ "vif" },
++	{ "" }
++};
++
++
++static DEFINE_XENBUS_DRIVER(netback, ,
++	.probe = netback_probe,
++	.remove = netback_remove,
++	.uevent = netback_uevent,
++	.otherend_changed = frontend_changed,
++);
++
++int xenvif_xenbus_init(void)
++{
++	return xenbus_register_backend(&netback_driver);
++}
++
++void xenvif_xenbus_fini(void)
++{
++	return xenbus_unregister_driver(&netback_driver);
++}

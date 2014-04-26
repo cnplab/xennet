@@ -67,6 +67,7 @@ prepare: get-drivers
 	patch -p1 < $(wildcard ../LINUX/patches/0001-*) ;\
 	patch -p1 < $(wildcard ../LINUX/patches/0002-*) ;\
 	cd LINUX ;\
+	rm -rf patches/diff--virtio_net.c--30b00--99999 ;\
 	export KSRC=$(KSRC);\
 	$(CROSS_MAKE) get-drivers;\
 	cd $(NETMAP_SRC);)
