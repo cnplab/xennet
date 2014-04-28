@@ -369,7 +369,7 @@ void netfront_netmap_attach(struct SOFTC_T *sc)
 	netmap_attach(&na);
 }
 
-static irqreturn_t xennet_tx_interrupt(int irq, void *dev_id)
+static irqreturn_t netfront_tx_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = dev_id;
 	struct netfront_info *np = netdev_priv(dev);
@@ -389,7 +389,7 @@ static irqreturn_t xennet_tx_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t xennet_rx_interrupt(int irq, void *dev_id)
+static irqreturn_t netfront_rx_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = dev_id;
 	struct netfront_info *np = netdev_priv(dev);
@@ -656,7 +656,7 @@ static int setup_netfront_netmap(struct xenbus_device *dev, struct SOFTC_T *sc)
 	if (err)
 		goto fail;
 
-	err = bind_evtchn_to_irqhandler(priv->tx_evtchn, xennet_tx_interrupt,
+	err = bind_evtchn_to_irqhandler(priv->tx_evtchn, netfront_tx_interrupt,
 					0, sc->netdev->name, sc->netdev);
 	priv->tx_irq = err;
 
@@ -665,7 +665,7 @@ static int setup_netfront_netmap(struct xenbus_device *dev, struct SOFTC_T *sc)
 	if (err)
 		goto rx_fail;
 
-	err = bind_evtchn_to_irqhandler(priv->rx_evtchn, xennet_rx_interrupt,
+	err = bind_evtchn_to_irqhandler(priv->rx_evtchn, netfront_rx_interrupt,
 					0, sc->netdev->name, sc->netdev);
 
 	priv->rx_irq = err;
