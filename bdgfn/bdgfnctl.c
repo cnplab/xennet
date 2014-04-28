@@ -136,14 +136,14 @@ int main(int argc, char **argv)
             continue;
 
 		bdgfninit();
-		ret = p->fn( parse_options(--argc, ++argv) );
+		ret = p->fn( (breq = parse_options(--argc, ++argv)) );
 		fprintf(stderr, "[%s]\n", ret ? "\033[31mnoterror\033[0m" : "\033[32mok\033[0m");
 		bdgfnfini();
+		free(breq);
     }
 
 	if (ret < 0) 
 		fprintf(stderr, "unknown command %s\n", *argv);
 
-	free(breq);
 	return 0;
 }
