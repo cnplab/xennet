@@ -57,8 +57,7 @@ get-drivers:
 	(cd .. ; \
 	for i in $(PATCHES) ; \
 	do patch -p1 < LINUX/patches/$$i; \
-	done ; );
-	cd -;
+	done ; cd -);
 
 
 prepare: get-drivers
