@@ -74,10 +74,10 @@ xnb_netmap_reg(struct netmap_adapter *na, int onoff)
 }
 
 static int
-xnb_sendbuf(netif_rx_back_ring_t *ring, void *buf, u_int len,
+xnb_rxgntcopy_set(netif_rx_back_ring_t *ring, void *buf, u_int len,
 	u_int gnt_idx, gnttab_copy_table gnttab, domid_t otherend_id)
 {
-	const netif_rx_request_t *rxq = RING_GET_REQUEST(ring, ring->rsp_prod_pvt);
+	const netif_rx_request_t *rxq = RING_GET_REQUEST(ring, ring->rsp_prod_pvt + gnt_idx);
 	int ofs = virt_to_offset( (vm_offset_t) buf);
 	
 	gnttab[gnt_idx].dest.u.ref = rxq->gref;
@@ -99,13 +99,7 @@ xnb_sendbuf(netif_rx_back_ring_t *ring, void *buf, u_int len,
 }
 
 static int
-xnb_gntmap(netif_rx_back_ring_t *ring, gnttab_map_table gntmap, int n_entries)
-{
-	return 0;
-}
-
-static int
-xnb_gntcopy(netif_rx_back_ring_t *ring, gnttab_copy_table gnttab, int n_entries)
+xnb_rxgntcopy(netif_rx_back_ring_t *ring, gnttab_copy_table gnttab, int n_entries)
 {
 	int error = 0;
 	int gnt_idx, i;
@@ -161,13 +155,6 @@ xnb_gntcopy(netif_rx_back_ring_t *ring, gnttab_copy_table gnttab, int n_entries)
 }
 
 static int
-xnb_recvbuf(netif_tx_back_ring_t *ring, void *pkt, u_int len,
-	gnttab_copy_table gnttab)
-{
-	return 0;
-}
-
-static int
 xnb_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
 {
 	struct netmap_kring *kring = &na->tx_rings[ring_nr];
@@ -175,7 +162,7 @@ xnb_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
 	u_int n;
 	u_int const cur = kring->rcur;
 	u_int const lim = kring->nkr_num_slots - 1;
-	u_int done;
+	u_int nm_i;
 
 	/* device-specific */
 	struct xnb_softc *xnb = na->ifp->if_softc;
@@ -184,50 +171,130 @@ xnb_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
 	RING_IDX space;
 	int n_responses, notify;
 
-	done = kring->nr_hwcur;
+	xen_rmb();
 	space = req_prod_local - rxr->req_cons;
 
-	if (!space)
-		goto txsync_done;
-
-	xen_rmb();
+	NDPRINTF("pkt:ring: space= %d req_cons= %d req_prod= %d\n", 
+		space, rxr->req_cons, req_prod_local);
 	
-	for (n = 0; done != cur; n++) {
-		struct netmap_slot *slot = &ring->slot[done];
-		u_int len = slot->len;
-		uint64_t paddr;
-		void *addr = PNMB(slot, &paddr);
+	nm_i = kring->nr_hwcur;
+	if (nm_i != cur) {
+		for (n = 0; nm_i != cur && n < space; n++) {
+			struct netmap_slot *slot = &ring->slot[nm_i];
+			u_int len = slot->len;
+			uint64_t paddr;
+			void *addr = PNMB(slot, &paddr);
+
+			/* device-specific */
+			xnb_rxgntcopy_set(rxr, addr, len, n, xnb->rx_gnttab, 
+				xnb->otherend_id);
+
+			nm_i = nm_next(nm_i, lim);
+		}
 		
-		if (n == space)
-			break;
-
-		/* device-specific */
-		xnb_sendbuf(rxr, addr, len, n, xnb->tx_gnttab, 
-			xnb->otherend_id);
-
-		done = nm_next(done, lim);
+		if (n) {
+			n_responses = xnb_rxgntcopy(rxr, xnb->rx_gnttab, n);
+			rxr->req_cons += n_responses;
+			rxr->rsp_prod_pvt += n_responses;
+			RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(rxr, notify);
+		
+			if (notify != 0)
+				xen_intr_signal(xnb->xen_intr_handle);
+		
+			rxr->sring->req_event = req_prod_local + 1;
+			xen_mb();
+		
+			kring->nr_hwcur = nm_i;
+			kring->nr_hwtail = nm_prev(nm_i, lim);
+		}
 	}
-	
-	NDPRINTF("pkt:ring: space= %d req_cons= %d req_prod= %d\n\tn= %d\n", 
-		space, rxr->req_cons, req_prod_local, n);
 
-	NDPRINTF("pkt:gntcopy: base= %p gops= %d\n", xnb->tx_gnttab, n);
-	n_responses = xnb_gntcopy(rxr, xnb->tx_gnttab, n);
-	rxr->req_cons += n_responses;
-	rxr->rsp_prod_pvt += n_responses;
-	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(rxr, notify);
-	
-	if (notify != 0)
-		xen_intr_signal(xnb->xen_intr_handle);
-	
-	rxr->sring->req_event = req_prod_local + 1;
-	xen_mb();
-	
-	kring->nr_hwcur = done;
-	kring->nr_hwtail = nm_prev(done, lim);
-txsync_done:
 	nm_txsync_finalize(kring);
 	return 0;
+}
+
+static int
+xnb_txgntcopy_set(netif_tx_back_ring_t *ring, void *buf, uint16_t *len,
+	u_int gnt_idx, gnttab_copy_table gnttab, domid_t otherend_id)
+{
+	const netif_tx_request_t *txq = RING_GET_REQUEST(ring, ring->rsp_prod_pvt + gnt_idx);
+	int ofs = virt_to_offset( (vm_offset_t) buf);
+	
+	*len = txq->size;
+	
+	gnttab[gnt_idx].source.u.ref = txq->gref;
+	gnttab[gnt_idx].source.domid = otherend_id;
+	gnttab[gnt_idx].source.offset = txq->offset;
+	gnttab[gnt_idx].dest.u.gmfn = virt_to_mfn( (vm_offset_t) buf);
+	gnttab[gnt_idx].dest.offset = ofs;
+	gnttab[gnt_idx].dest.domid = DOMID_SELF;
+	gnttab[gnt_idx].len = *len;
+	gnttab[gnt_idx].flags = GNTCOPY_source_gref;
+
+	NDPRINTF("pkt addr= %p\n", buf);
+	NDPRINTF("pkt:gnttab id= %u\n", txq->id);
+	NDPRINTF("pkt:gnttab gnt_idx= %u\n", gnt_idx);
+	NDPRINTF("pkt:gnttab size= %u\n", gnttab[gnt_idx].len);
+	NDPRINTF("pkt:gnttab source.u.ref= %u\n", gnttab[gnt_idx].source.u.ref);
+	NDPRINTF("pkt:gnttab source.offset= %u\n", gnttab[gnt_idx].source.offset);
+	NDPRINTF("pkt:gnttab dest.u.gmfn= %lu\n", gnttab[gnt_idx].dest.u.gmfn);
+	NDPRINTF("pkt:gnttab dest.u.offset= %u\n", gnttab[gnt_idx].dest.offset);
+	
+	return 0;
+}
+
+static int
+xnb_txgntcopy(netif_tx_back_ring_t *ring, gnttab_copy_table gnttab, int n_entries)
+{
+	int error = 0;
+	int gnt_idx, i;
+	int n_responses = 0;
+	RING_IDX r_idx;
+
+	int __unused hv_ret = HYPERVISOR_grant_table_op(GNTTABOP_copy,
+		gnttab, n_entries);
+	
+	for (gnt_idx = 0; gnt_idx < n_entries; gnt_idx++) {
+		int16_t status = gnttab[gnt_idx].status;
+		if (status != GNTST_okay) {
+			DPRINTF(
+			    "Got error %d (gnt_idx=%u n_entries=%d) for hypervisor gnttab_copy status\n",
+			    status, gnt_idx, n_entries);
+			error = 1;
+			break;
+		}
+		n_responses++;
+	}
+	
+	if (error) {
+		uint16_t id;
+		netif_tx_response_t *rsp;
+		
+		id = RING_GET_REQUEST(ring, ring->rsp_prod_pvt)->id;
+		rsp = RING_GET_RESPONSE(ring, ring->rsp_prod_pvt);
+		rsp->id = id;
+		rsp->status = NETIF_RSP_ERROR;
+		n_responses = 1;
+	} else {
+		gnt_idx = 0;
+		for (i = 0; i < n_responses; i++) {
+			netif_tx_request_t rxq;
+			netif_tx_response_t *rsp;
+
+			r_idx = ring->rsp_prod_pvt + i;
+			/*
+			 * We copy the structure of rxq instead of making a
+			 * pointer because it shares the same memory as rsp.
+			 */
+			rxq = *(RING_GET_REQUEST(ring, r_idx));
+			rsp = RING_GET_RESPONSE(ring, r_idx);
+			rsp->id = rxq.id;
+			rsp->status = NETIF_RSP_OKAY;
+			gnt_idx++;
+		}
+	}
+
+	return n_responses;
 }
 
 static int
@@ -236,66 +303,72 @@ xnb_netmap_rxsync(struct netmap_adapter *na, u_int ring_nr, int flags)
 	struct netmap_kring *kring = &na->rx_rings[ring_nr];
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;	/* index into the netmap ring */
-	u_int nic_i;	/* index into the NIC ring */
 	u_int n;
+	u_int space;
 	u_int const lim = kring->nkr_num_slots - 1;
 	u_int const head = nm_rxsync_prologue(kring);
 	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
 
 	/* device-specific */
 	struct xnb_softc *xnb = na->ifp->if_softc;
-	netif_tx_back_ring_t * rxr =
+	netif_tx_back_ring_t * txr =
 		&xnb->ring_configs[XNB_RING_TYPE_TX].back_ring.tx_ring;
+	int n_responses, notify;
+	RING_IDX unconsumed;
 
-	if (head > lim)
+	if (head > lim) {
+		DPRINTF("dangerous reset!!!\n");
 		return netmap_ring_reinit(kring);
-
-	if (netmap_no_pendintr || force_update) {
-		nic_i = kring->nr_hwtail;
-		nm_i = netmap_idx_n2k(kring, nic_i);
-
-		for (n = 0; ; n++) {
-			break; // Check CSB
-			nm_i = nm_next(nm_i, lim);
-			nic_i = nm_next(nic_i, lim);
-		}
-		if (n) { /* update the state variables */
-			kring->nr_hwtail = nm_i;
-		}
-		kring->nr_kflags &= ~NKR_PENDINTR;
 	}
+	
+	space = kring->nr_hwtail - kring->nr_hwcur;
+        if (space <= 0)
+                space += kring->nkr_num_slots;
 
-	nm_i = kring->nr_hwcur;
-	if (nm_i != head) {
-		nic_i = netmap_idx_k2n(kring, nm_i);
-		for (n = 0; nm_i != head; n++) {
+	xen_rmb();
+	unconsumed = txr->sring->req_prod - txr->req_cons;
+	if (space < unconsumed)
+		unconsumed = space;
+
+	if (unconsumed || force_update) {
+		uint16_t slot_flags = kring->nkr_slot_flags;
+
+		nm_i = kring->nr_hwtail;
+		for (n = 0; n < unconsumed; n++) {
 			struct netmap_slot *slot = &ring->slot[nm_i];
 			uint64_t paddr;
-			u_int len = slot->len;
 			void *addr = PNMB(slot, &paddr);
+			uint16_t *len = &slot->len;
 
-			if (addr == netmap_buffer_base) /* bad buf */
-				goto ring_reset;
+			slot->flags = slot_flags;
 			
 			/* device-specific */
-			xnb_recvbuf(rxr, addr, len, xnb->rx_gnttab);
-
-			slot->flags &= ~NS_BUF_CHANGED;
+			xnb_txgntcopy_set(txr, addr, len, n, xnb->tx_gnttab,
+				xnb->otherend_id);
+			
 			nm_i = nm_next(nm_i, lim);
-			nic_i = nm_next(nic_i, lim);
 		}
-		kring->nr_hwcur = head;
+		
+		if (n) { /* update the state variables */
+			n_responses = xnb_txgntcopy(txr, xnb->tx_gnttab, n);
+			txr->rsp_prod_pvt += n_responses;
+			txr->req_cons += n_responses;
+			kring->nr_hwtail = nm_i;
 
-		nic_i = nm_prev(nic_i, lim);
+			RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(txr, notify);
+			if (notify != 0)
+				xen_intr_signal(xnb->xen_intr_handle);
+		
+			txr->sring->req_event = txr->req_cons + 1;
+			xen_mb();
+		}
+		kring->nr_kflags &= ~NKR_PENDINTR;
 	}
 
 	/* tell userspace that there might be new packets */
 	nm_rxsync_finalize(kring);
 
 	return 0;
-
-ring_reset:
-	return netmap_ring_reinit(kring);
 }
 
 static void
@@ -307,8 +380,15 @@ xnb_netmap_attach(struct xnb_softc *xnb)
 
 	na.ifp = xnb->xnb_ifp;
 	na.na_flags = NAF_BDG_MAYSLEEP;
+	/**
+ 	  * Number of TX descriptors fit the amount that netback 
+ 	  * can do simultaneously i.e. GNTTAB_LEN
+ 	  * Number of RX descriptors fits twice more to accomodate 
+ 	  * more packets in case consumer is too fast
+ 	  */
 	na.num_tx_desc = GNTTAB_LEN;
-	na.num_rx_desc = GNTTAB_LEN;
+	na.num_rx_desc = NET_RX_RING_SIZE;
+
 	na.nm_txsync = xnb_netmap_txsync;
 	na.nm_rxsync = xnb_netmap_rxsync;
 	na.nm_register = xnb_netmap_reg;
