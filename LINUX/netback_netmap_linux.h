@@ -145,7 +145,8 @@ int xenvif_netmap_irq(struct SOFTC_T *vif, int tx)
 		nm_txsync_prologue(&na->tx_rings[0]);
 		na->nm_txsync(na, 0, 0);
 		vwna->guest_need_txkick = 0;
-		notify_remote_via_irq(vif->tx_irq);
+		if (vif->tx_irq)
+			notify_remote_via_irq(vif->tx_irq);
 	} else {
 		na->nm_rxsync(na, 0, 0);
 		vwna->guest_need_rxkick = 1;
@@ -308,7 +309,8 @@ int xenvif_notify(struct netmap_adapter *na, u_int ring_nr,
 	error = xenvif_netmap_rxsync(na, ring_nr, 0);
 	if (vwna->guest_need_rxkick) {
 		vwna->guest_need_rxkick = 0;
-		notify_remote_via_irq(vif->rx_irq);
+		if (vif->rx_irq)
+			notify_remote_via_irq(vif->rx_irq);
 	}
 
 	nm_kr_put(kring);
