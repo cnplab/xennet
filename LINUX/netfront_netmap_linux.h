@@ -52,6 +52,7 @@
 #define VIFGREF(r,i) 	r->slot[i].len
 #endif
 
+#include <xen/balloon.h>
 #include <linux/log2.h>
 
 #define NETFRONT_BUF_SIZE	 2048
@@ -89,6 +90,8 @@ struct netmap_gnt {
 	struct gnttab_map_entry *ring_gnt;
 	struct gnttab_map_grant_ref *bufs_map;
 	struct gnttab_map_entry *bufs_gnt;
+	struct page **ring_pages;
+	struct page **bufs_pages;
 	uint32_t nr_ring_grefs;
 	uint32_t nr_bufs_grefs;
 	char  *bufs_base;
@@ -435,7 +438,7 @@ static inline int order(int nr_grefs)
 #define __alloc_pages(order) __get_free_pages(GFP_ATOMIC | __GFP_ZERO, order)
 
 #define map_ops_new(nrefs,addr,op,pte)	\
-	addr = __alloc_pages(order(nrefs)); \
+	err = alloc_xenballooned_pages(nr_grefs, addr, false); \
 	op = vmalloc(nr_grefs * sizeof(struct gnttab_map_grant_ref)); \
 	pte = vmalloc(nr_grefs * sizeof(struct gnttab_map_entry))
 
@@ -443,25 +446,30 @@ static int gnttab_map(struct netmap_gnt *rdesc, domid_t dom, int ring)
 {
 	int i;
 	int err = 0, gnt_err = 0;
-	unsigned long addr = 0;
-	int nr_grefs = 0;
+	int nr_grefs = !ring ? rdesc->nr_ring_grefs : rdesc->nr_bufs_grefs;
 	struct gnttab_map_grant_ref *op = NULL;
 	struct gnttab_map_entry *pte = NULL;
 	uint32_t *grefs = NULL;
+	struct page **mmap_pages;
 
 	if (!ring) {
-		nr_grefs = rdesc->nr_ring_grefs;
-		map_ops_new(nr_grefs, addr, op, pte);
+		mmap_pages = rdesc->ring_pages = vmalloc(nr_grefs * sizeof(struct page *));
+		map_ops_new(nr_grefs, rdesc->ring_pages, op, pte);
 		nr_grefs--;
 		rdesc->ring_map = op;
 	 	rdesc->ring_gnt = pte;
 		grefs = rdesc->ring_grefs;
 	} else {
-		nr_grefs = rdesc->nr_bufs_grefs;
-		map_ops_new(nr_grefs, addr, op, pte);
+		mmap_pages = rdesc->bufs_pages = vmalloc(nr_grefs * sizeof(struct page *));
+		map_ops_new(nr_grefs, rdesc->bufs_pages, op, pte);
 		rdesc->bufs_map = op;
 	 	rdesc->bufs_gnt = pte;
 		grefs = rdesc->bufs_grefs;
+	}
+
+	if (err) {
+		pr_info("Could not reserve mmap_pages");
+		return -ENOMEM;
 	}
 
 	dom = 0; // XXX network stub domains
@@ -470,7 +478,7 @@ static int gnttab_map(struct netmap_gnt *rdesc, domid_t dom, int ring)
 			op[i].ref   = (grant_ref_t) grefs[i];
 			op[i].dom   = (domid_t) dom;
 			op[i].flags = GNTMAP_host_map;
-			op[i].host_addr = addr + PAGE_SIZE * i;
+			op[i].host_addr = (unsigned long) pfn_to_kaddr(page_to_pfn(mmap_pages[i]));
 
 			pr_debug("map flags %d ref %d host_addr %d",
 					op[i].flags, op[i].ref, op[i].host_addr);
@@ -533,8 +541,17 @@ static int gnttab_unmap(struct netmap_gnt *rdesc)
 				op, rdesc->nr_ring_grefs + rdesc->nr_bufs_grefs))
 		BUG();
 
+	free_xenballooned_pages(rdesc->nr_ring_grefs, rdesc->ring_pages);
+	free_xenballooned_pages(rdesc->nr_bufs_grefs, rdesc->bufs_pages);
+
+	vfree(rdesc->ring_pages);
+	vfree(rdesc->bufs_pages);
+
 	vfree(rdesc->ring_grefs);
 	vfree(rdesc->bufs_grefs);
+
+	rdesc->ring_pages = rdesc->bufs_pages = NULL;
+	rdesc->ring_grefs = rdesc->bufs_grefs = NULL;
 	return 0;
 }
 
@@ -717,18 +734,23 @@ void xennet_netmap_disconnect(struct SOFTC_T *sc)
 {
 	struct netmap_info *ni = sc->na_priv;
 
+	netif_carrier_off(sc->netdev);
+
 	unbind_from_irqhandler(ni->rx_irq, sc->netdev);
 	unbind_from_irqhandler(ni->tx_irq, sc->netdev);
 
+	ni->tx_evtchn = ni->rx_evtchn = 0;
+	ni->tx_irq = ni->rx_irq = 0;
+
 	netmap_detach(sc->netdev);
-	
-	/* Unmapping rings currently gives a panic in
-	 * unregister_netdev */
-	//gnttab_unmap(&ni->rxd);
-	//gnttab_unmap(&ni->txd);
+
+	gnttab_unmap(&ni->rxd);
+	gnttab_unmap(&ni->txd);
 
 	vfree(ni->stat);
 	vfree(ni);
+
+	ni = NULL;
 }
 
 #endif /* __XEN_NETFRONT_NETMAP_H__ */
