@@ -294,11 +294,18 @@ int xenvif_notify(struct netmap_adapter *na, u_int ring_nr,
 		return 0;
 	}
 
+	if (!netif_carrier_ok(ifp)) {
+		return 0;
+	}
+
 	/* we only care about receive interrupts */
 	if (tx == NR_TX)
 		return 0;
 
 	vif = netdev_priv(vna->ifp);
+	if (vif == NULL)
+		return 0;
+
 	kring = &na->rx_rings[ring_nr];
 	ring = kring->ring;
 
