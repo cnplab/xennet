@@ -154,10 +154,10 @@ static int netfront_netmap_reg(struct netmap_adapter *na, int onoff)
 	return error;
 }
 
-int netfront_netmap_rxsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+int netfront_netmap_rxsync(struct netmap_kring *kring, int flags)
 {
+    struct netmap_adapter *na = kring->na;
 	struct netfront_info *nf = netdev_priv(na->ifp);
-	struct netmap_kring *kring = &na->rx_rings[ring_nr];
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;	/* index into the netmap ring */ //j,
 	u_int n;
@@ -268,12 +268,12 @@ static int netfront_netmap_xmit(struct SOFTC_T *np, char *buf, u_int len)
 	return 1;
 }
 
-int netfront_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+int netfront_netmap_txsync(struct netmap_kring *kring, int flags)
 {
+    struct netmap_adapter *na = kring->na;
 	struct ifnet *ifp = na->ifp;
 	struct netfront_info *nf = netdev_priv(na->ifp);
 	struct netmap_info *ni = nf->na_priv;
-	struct netmap_kring *kring = &na->tx_rings[ring_nr];
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;	/* index into the netmap ring */
 	u_int nic_i;	/* index into the NIC ring */
