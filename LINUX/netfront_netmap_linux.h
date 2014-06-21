@@ -547,7 +547,8 @@ static int gnttab_unmap(struct netmap_gnt *rdesc)
 
 	vfree(rdesc->ring_gnt);
 	vfree(rdesc->ring_grefs);
-	rdesc->ring_grefs = rdesc->ring_gnt = NULL;
+	rdesc->ring_grefs = NULL;
+	rdesc->ring_gnt = NULL;
 
 	for (i = 0; i < rdesc->nr_bufs_grefs; ++i, ++j) {
 		op[j].host_addr = bufs_gnt[i].host_addr;
@@ -569,7 +570,8 @@ static int gnttab_unmap(struct netmap_gnt *rdesc)
 	vfree(rdesc->bufs_gnt);
 	vfree(rdesc->bufs_grefs);
 
-	rdesc->bufs_grefs = rdesc->bufs_gnt = NULL;
+	rdesc->bufs_grefs = NULL;
+	rdesc->bufs_gnt = NULL;
 	rdesc->bufs_pages = NULL;
 	return 0;
 }
