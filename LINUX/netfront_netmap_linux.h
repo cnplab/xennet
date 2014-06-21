@@ -626,7 +626,7 @@ static int xenbus_read_bufs_grefs(struct netmap_ring *ring, struct netmap_gnt *r
 	rdesc->nr_bufs_grefs = ring->num_slots/2;
 	rdesc->bufs_grefs = vmalloc(1 + rdesc->nr_bufs_grefs * sizeof(uint32_t));
 
-	for (i = 1, j = 0; i < ring->num_slots; i++) {
+	for (i = 0, j = 0; i < ring->num_slots; i++) {
 		if (VIFGREF(ring, i) != 0) {
 			rdesc->bufs_grefs[j++] = VIFGREF(ring, i);
 		}
