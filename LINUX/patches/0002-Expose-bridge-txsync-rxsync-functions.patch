@@ -1,6 +1,6 @@
-From 1664c6d586e97e9b6cadc7122487114b946e74a7 Mon Sep 17 00:00:00 2001
-From: Joao Martins <Joao.Martins@neclab.eu>
-Date: Thu, 13 Mar 2014 19:06:37 +0000
+From b990b10e3364049b5090e49373f871960f08739b Mon Sep 17 00:00:00 2001
+From: Joao Martins <joao.martins@neclab.eu>
+Date: Mon, 25 Aug 2014 23:03:38 +0200
 Subject: [PATCH] Expose bridge txsync/rxsync functions
 
 ---
@@ -8,15 +8,15 @@ Subject: [PATCH] Expose bridge txsync/rxsync functions
  1 file changed, 2 insertions(+)
 
 diff --git a/sys/dev/netmap/netmap_vale.c b/sys/dev/netmap/netmap_vale.c
-index d65809d..127a0e0 100644
+index 2e86443..a1238af 100644
 --- a/sys/dev/netmap/netmap_vale.c
 +++ b/sys/dev/netmap/netmap_vale.c
-@@ -2036,6 +2036,8 @@ netmap_bwrap_attach(struct ifnet *fake, struct ifnet *real)
+@@ -2050,6 +2050,8 @@ netmap_bwrap_attach(struct ifnet *fake, struct ifnet *real)
  	na->nm_register = netmap_bwrap_register;
  	// na->nm_txsync = netmap_bwrap_txsync;
  	// na->nm_rxsync = netmap_bwrap_rxsync;
-+	na->nm_txsync = bdg_netmap_txsync;
-+	na->nm_rxsync = bdg_netmap_rxsync;
++	na->nm_txsync = netmap_vp_txsync;
++	na->nm_rxsync = netmap_vp_rxsync;
  	na->nm_config = netmap_bwrap_config;
  	na->nm_krings_create = netmap_bwrap_krings_create;
  	na->nm_krings_delete = netmap_bwrap_krings_delete;
