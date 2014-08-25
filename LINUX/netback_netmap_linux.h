@@ -71,9 +71,8 @@ struct netmap_vpwrap_adapter {
 };
 
 static int xenvif_notify(struct netmap_adapter *na, u_int ring_nr, enum txrx tx, int flags);
-static int xenvif_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags);
-static int xenvif_netmap_rxsync(struct netmap_adapter *na, u_int ring_nr, int flags);
-
+static int xenvif_netmap_txsync(struct netmap_kring *kring, int flags);
+static int xenvif_netmap_rxsync(struct netmap_kring *kring, int flags);
 static void xenvif_netmap_map(struct SOFTC_T *info, struct netmap_adapter *na);
 static void xenvif_netmap_unmap(struct SOFTC_T *vif);
 
@@ -143,12 +142,12 @@ int xenvif_netmap_irq(struct SOFTC_T *vif, int tx)
 
 	if (tx) {
 		nm_txsync_prologue(&na->tx_rings[0]);
-		na->nm_txsync(na, 0, 0);
+		na->nm_txsync(&na->tx_rings[0], 0);
 		vwna->guest_need_txkick = 0;
 		if (vif->tx_irq)
 			notify_remote_via_irq(vif->tx_irq);
 	} else {
-		na->nm_rxsync(na, 0, 0);
+		na->nm_rxsync(&na->tx_rings[0], 0);
 		vwna->guest_need_rxkick = 1;
 	}
 
@@ -219,14 +218,14 @@ int xenvif_netmap_kthread(void *data)
 	return 0;
 }
 
-int xenvif_netmap_txsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+int xenvif_netmap_txsync(struct netmap_kring *kring, int flags)
 {
 	return 0;
 }
 
-int xenvif_netmap_rxsync(struct netmap_adapter *na, u_int ring_nr, int flags)
+int xenvif_netmap_rxsync(struct netmap_kring *kring, int flags)
 {
-	struct netmap_kring *kring = &na->rx_rings[ring_nr];
+	struct netmap_adapter *na = kring->na;
 	struct netmap_ring *ring = kring->ring;
 	u_int nm_i;
 	u_int const lim = kring->nkr_num_slots - 1;
@@ -313,7 +312,7 @@ int xenvif_notify(struct netmap_adapter *na, u_int ring_nr,
 	if (nm_kr_tryget(kring))
 		return 0;
 
-	error = xenvif_netmap_rxsync(na, ring_nr, 0);
+	error = xenvif_netmap_rxsync(kring, 0);
 	if (vwna->guest_need_rxkick) {
 		vwna->guest_need_rxkick = 0;
 		if (vif->rx_irq)
